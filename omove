@@ -1,0 +1,101 @@
+#!/bin/bash
+# omove - Ollama Tiered Storage Manager (v2.1)
+# Handles Hot (NVMe) / Cold (HDD) transitions with batch support
+
+HOT_PATH="/usr/share/ollama/.ollama/models"
+COLD_PATH="/media/elysium/ollama_archive"
+OLLAMA_USER="ollama"
+
+# Ensure directories exist with correct permissions
+setup_dirs() {
+    sudo mkdir -p "$COLD_PATH/blobs" "$COLD_PATH/manifests"
+    sudo chown -R $OLLAMA_USER:$OLLAMA_USER "$COLD_PATH"
+}
+
+list_cold() {
+    echo -e "NAME\t\t\tID\t\tSIZE\t\tMODIFIED"
+    echo -e "------------------------------------------------------------------------"
+    find "$COLD_PATH/manifests" -type f | while read -r manifest; do
+        rel_name=${manifest#$COLD_PATH/manifests/}
+        id=$(jq -r '.config.digest' "$manifest" | cut -d: -f2 | cut -c1-12)
+        size_bytes=$(jq '[.layers[].size] | add' "$manifest")
+        size_gb=$(echo "scale=2; $size_bytes / 1024 / 1024 / 1024" | bc)
+        mod_date=$(stat -c %y "$manifest" | cut -d' ' -f1)
+        printf "%-24s %-12s %-10s %-10s\n" "$rel_name" "$id" "${size_gb} GB" "$mod_date"
+    done
+}
+
+freeze_model() {
+    local model=$1
+    # Convert colon to slash for path searching (e.g., nomic-embed-text:latest -> nomic-embed-text/latest)
+    local model_path="${model//:/\/}"
+    
+    # Use -wholename to find the file ending in the model path
+    local manifest_file=$(find "$HOT_PATH/manifests" -wholename "*$model_path" -type f | head -n 1)
+    
+    if [[ -z "$manifest_file" ]]; then
+        echo "Error: Model '$model' not found in Hot Storage ($HOT_PATH)."
+        return 1
+    fi
+
+    echo "Archiving $model to HDD..."
+    local hashes=$(jq -r '.config.digest, .layers[].digest' "$manifest_file")
+
+    for full_hash in $hashes; do
+        local hash_file="sha256-${full_hash#sha256:}"
+        if [[ -f "$HOT_PATH/blobs/$hash_file" ]]; then
+            sudo rsync -a --remove-source-files "$HOT_PATH/blobs/$hash_file" "$COLD_PATH/blobs/"
+        fi
+    done
+
+    local dest_manifest="$COLD_PATH/manifests/$model"
+    sudo mkdir -p "$(dirname "$dest_manifest")"
+    sudo mv "$manifest_file" "$dest_manifest"
+    
+    sudo chown -R $OLLAMA_USER:$OLLAMA_USER "$COLD_PATH"
+    echo "Done. $model is now in Cold Storage."
+}
+
+thaw_model() {
+    local model=$1
+    local cold_manifest="$COLD_PATH/manifests/$model"
+
+    if [[ ! -f "$cold_manifest" ]]; then
+        echo "Error: Model '$model' not found in Cold Storage."
+        return 1
+    fi
+
+    echo "Restoring $model to NVMe..."
+    local hot_dest="$HOT_PATH/manifests/registry.ollama.ai/library/$model"
+    sudo mkdir -p "$(dirname "$hot_dest")"
+    sudo mv "$cold_manifest" "$hot_dest"
+
+    local hashes=$(jq -r '.config.digest, .layers[].digest' "$hot_dest")
+    for full_hash in $hashes; do
+        local hash_file="sha256-${full_hash#sha256:}"
+        if [[ -f "$COLD_PATH/blobs/$hash_file" ]]; then
+            sudo rsync -a --remove-source-files "$COLD_PATH/blobs/$hash_file" "$HOT_PATH/blobs/"
+        fi
+    done
+
+    sudo chown -R $OLLAMA_USER:$OLLAMA_USER "$HOT_PATH"
+    echo "Done. $model is now in Hot Storage."
+}
+
+COMMAND=$1
+shift # Remove the command from the argument list
+
+case $COMMAND in
+    list)
+        list_cold
+        ;;
+    freeze)
+        for m in "$@"; do freeze_model "$m"; done
+        ;;
+    thaw)
+        for m in "$@"; do thaw_model "$m"; done
+        ;;
+    *)
+        echo "Usage: omove {list|freeze <name1> [name2...]|thaw <name1> [name2...]}"
+        ;;
+esac

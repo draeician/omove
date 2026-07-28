@@ -8,12 +8,15 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 from omove.errors import InsufficientSpaceError, ManifestError, OmoveError
 from omove.logging_util import error, info
 from omove.manifest import blob_filename
 from omove.system import Session
+
+_PROGRESS_MIN_BYTES = 16 * 1024 * 1024
 
 
 def format_bytes(num: int) -> str:
@@ -32,12 +35,58 @@ def format_bytes(num: int) -> str:
     return f"{int(num)}B"
 
 
-def file_sha256(path: Path) -> str:
-    """Return hex sha256 of a file."""
+def _want_progress(total: int) -> bool:
+    if total < _PROGRESS_MIN_BYTES:
+        return False
+    return sys.stderr.isatty() or sys.stdout.isatty()
+
+
+def _render_progress(prefix: str, done: int, total: int, started: float) -> None:
+    pct = 0.0 if total <= 0 else min(100.0, 100.0 * done / total)
+    elapsed = max(time.monotonic() - started, 0.001)
+    rate = done / elapsed
+    eta = ""
+    if done > 0 and done < total:
+        remaining = (total - done) / rate
+        eta = f" ETA {int(remaining // 60):02d}:{int(remaining % 60):02d}"
+    bar_w = 24
+    filled = 0 if total <= 0 else int(bar_w * done / total)
+    bar = "#" * filled + "-" * (bar_w - filled)
+    line = (
+        f"\r{prefix} [{bar}] {pct:5.1f}% "
+        f"{format_bytes(done)}/{format_bytes(total)} "
+        f"{format_bytes(int(rate))}/s{eta}   "
+    )
+    print(line, end="", file=sys.stderr, flush=True)
+
+
+def file_sha256(
+    path: Path,
+    *,
+    progress_label: str | None = None,
+) -> str:
+    """Return hex sha256 of a file, with optional stderr progress."""
+    total = path.stat().st_size
+    show = progress_label is not None and _want_progress(total)
     digest = hashlib.sha256()
+    done = 0
+    started = time.monotonic()
+    last_draw = 0.0
+    prefix = progress_label or "Hashing"
     with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+        while True:
+            chunk = handle.read(1024 * 1024)
+            if not chunk:
+                break
             digest.update(chunk)
+            done += len(chunk)
+            if show:
+                now = time.monotonic()
+                if now - last_draw >= 0.2 or done >= total:
+                    _render_progress(prefix, done, total, started)
+                    last_draw = now
+    if show:
+        print(file=sys.stderr, flush=True)
     return digest.hexdigest()
 
 
@@ -46,6 +95,7 @@ def verify_blob(
     digest: str,
     *,
     cache: dict[str, bool] | None = None,
+    progress: bool = False,
 ) -> None:
     """Verify blob path matches digest; raise on failure."""
     cache_key = f"{path}|{digest}"
@@ -54,8 +104,18 @@ def verify_blob(
     if not path.is_file() or path.is_symlink():
         raise OmoveError(f"Missing blob: {path}")
     expected = digest.removeprefix("sha256:").lower()
+    short = expected[:12]
+    label = None
+    if progress:
+        try:
+            size = path.stat().st_size
+        except OSError:
+            size = 0
+        if size >= _PROGRESS_MIN_BYTES:
+            info(f"Hashing blob {short} ({format_bytes(size)})...")
+            label = f"Hash {short}"
     try:
-        actual = file_sha256(path)
+        actual = file_sha256(path, progress_label=label)
     except OSError as exc:
         raise OmoveError(f"Unable to hash blob: {path}") from exc
     if actual != expected:
@@ -115,15 +175,27 @@ def check_destination_space(
 
 
 def _rsync_copy(source: Path, destination: Path) -> None:
-    options = ["-a", "--sparse", "--protect-args"]
-    if sys.stdout.isatty():
+    """Copy a file with rsync; do not preserve owner/group.
+
+    ``-a`` includes owner/group; many network mounts reject chown even as
+    root (NFS root_squash / autofs), which makes rsync exit 23 after a
+    successful data transfer.
+    """
+    options = [
+        "-a",
+        "--sparse",
+        "--protect-args",
+        "--no-owner",
+        "--no-group",
+    ]
+    if sys.stdout.isatty() or sys.stderr.isatty():
         options.append("--info=progress2")
     result = subprocess.run(
         ["rsync", *options, "--", str(source), str(destination)],
         check=False,
     )
     if result.returncode != 0:
-        raise OmoveError(f"Blob copy failed: {source}")
+        raise OmoveError(f"Copy failed: {source} -> {destination}")
 
 
 def copy_blob_verified(
@@ -139,21 +211,27 @@ def copy_blob_verified(
     filename = blob_filename(digest)
     source_blob = source_root / "blobs" / filename
     destination_blob = destination_root / "blobs" / filename
-    verify_blob(source_blob, digest, cache=cache)
+    short = digest.removeprefix("sha256:")[:12]
+    try:
+        size = source_blob.stat().st_size
+    except OSError:
+        size = 0
+    verify_blob(source_blob, digest, cache=cache, progress=True)
 
     if destination_blob.exists():
-        verify_blob(destination_blob, digest, cache=cache)
+        info(f"Blob {short} already present at destination; verifying...")
+        verify_blob(destination_blob, digest, cache=cache, progress=True)
         return
 
     if dry_run:
-        info(f"[dry-run] would copy blob {digest[7:19]}...")
+        info(f"[dry-run] would copy blob {short} ({format_bytes(size)})...")
         return
 
-    info(f"Copying blob {digest[7:19]}...")
+    info(f"Copying blob {short} ({format_bytes(size)})...")
     blobs_dir = destination_root / "blobs"
     blobs_dir.mkdir(parents=True, exist_ok=True)
     fd, temp_name = tempfile.mkstemp(
-        prefix=f".omove-{digest[7:19]}.",
+        prefix=f".omove-{short}.",
         dir=str(blobs_dir),
     )
     os.close(fd)
@@ -161,7 +239,8 @@ def copy_blob_verified(
     session.register_temp(temp_blob)
     try:
         _rsync_copy(source_blob, temp_blob)
-        verify_blob(temp_blob, digest, cache=cache)
+        info(f"Verifying copied blob {short}...")
+        verify_blob(temp_blob, digest, cache=cache, progress=True)
         os.replace(temp_blob, destination_blob)
         if temp_blob in session.temps:
             session.temps.remove(temp_blob)
@@ -207,19 +286,7 @@ def copy_manifest_verified(
     temp_manifest = Path(temp_name)
     session.register_temp(temp_manifest)
     try:
-        result = subprocess.run(
-            [
-                "rsync",
-                "-a",
-                "--protect-args",
-                "--",
-                str(source_manifest),
-                str(temp_manifest),
-            ],
-            check=False,
-        )
-        if result.returncode != 0:
-            raise OmoveError(f"Manifest copy failed: {source_manifest}")
+        _rsync_copy(source_manifest, temp_manifest)
         if source_manifest.read_bytes() != temp_manifest.read_bytes():
             raise OmoveError(
                 f"Manifest verification failed after copy: {source_manifest}"

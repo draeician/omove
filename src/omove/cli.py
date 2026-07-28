@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import sys
 from collections.abc import Sequence
+from pathlib import Path
 
 from omove import __version__
 from omove.config import (
@@ -15,6 +16,7 @@ from omove.config import (
 from omove.errors import OmoveError, UsageError
 from omove.logging_util import error
 from omove.migrate import run_migrate
+from omove.package import export_models, import_packages
 from omove.store import list_store, verify_store
 from omove.system import prepare_mutation, prepare_read_operation
 from omove.transition import transition_models
@@ -22,55 +24,45 @@ from omove.transition import transition_models
 USAGE = """\
 omove - Ollama Tiered Storage Manager
 
-Moves Ollama models between:
-  hot  = the live model directory Ollama uses
-  cold = an archive directory you choose (often on a bigger/slower disk)
+hot   = live model directory Ollama uses
+cold  = on-disk archive in Ollama layout (quick freeze/thaw)
+export packages = portable .omove.tar.gz files for cloud backup
 
 Usage:
   omove list [cold|hot]
   omove freeze <model> [model ...]
   omove thaw <model> [model ...]
+  omove export <model> [model ...] [--from hot|cold] [-o PATH] [--remove]
+  omove import <package.omove.tar.gz> [...] [--to hot|cold]
   omove verify [cold|hot] [model ...]
   omove migrate [all|cold|hot]
-  omove migrate cold <model> [model ...]
-  omove migrate hot <model> [model ...]
-  omove version
-  omove help
+  omove migrate cold|hot <model> ...
+  omove version | help
   omove config path|show|init
 
-Config file (recommended):
-  ~/.config/omove/config.toml
-  Create with:  omove config init
-  Precedence:   environment > config file > defaults
+freeze / thaw
+  Quick move between hot and cold stores (same Ollama layout).
 
-What the path settings mean:
-  hot_path / OMOVE_HOT_PATH / OLLAMA_MODELS
-      Live Ollama models directory.
-  cold_path / OMOVE_COLD_PATH
-      Archive directory for frozen models.
-  cold_mount / OMOVE_COLD_MOUNT
-      Optional. Disk mount that should hold the archive (example: /opt/md2).
-      If omitted, omove detects it automatically. It does NOT need to be the
-      parent folder of cold_path.
-  allow_unmounted_cold / OMOVE_ALLOW_UNMOUNTED_COLD=1
-      Allow the archive to live on the root disk (/). Off by default because
-      that often means a removable disk was not mounted.
-  allow_live_ollama / OMOVE_ALLOW_LIVE_OLLAMA=1
-      Allow changes while Ollama is still running. Off by default because that
-      can corrupt models.
+export / import
+  Package a model (manifest + all blobs) into a portable .omove.tar.gz
+  for cloud backup, or restore it later.
+  Default export directory: <cold_path>/exports
+    override with:  -o PATH  or  export_path in config  or  OMOVE_EXPORT_PATH
+  --from hot|cold   which store to read (default: hot)
+  --remove          delete the model from that store after a successful export
+  --to hot|cold     where import writes (default: hot)
 
-Other:
-  OMOVE_OLLAMA_USER      Service account (default: ollama)
-  OMOVE_OLLAMA_SERVICE   systemd unit (default: ollama.service)
-  OMOVE_LOCK_FILE        Lock file path
+Config file: ~/.config/omove/config.toml  (omove config init)
 
-Python extras:
-  --dry-run   Show freeze/thaw/migrate plan without changing files
-  --json      Machine-readable list/verify output
+Paths:
+  hot_path / OMOVE_HOT_PATH / OLLAMA_MODELS   live Ollama models
+  cold_path / OMOVE_COLD_PATH                freeze/thaw archive
+  export_path / OMOVE_EXPORT_PATH            default export packages dir
+  cold_mount / OMOVE_COLD_MOUNT              optional disk-mount pin
+  allow_unmounted_cold                       allow archive on root disk /
+  allow_live_ollama                          allow mutate while ollama runs
 
-freeze/thaw/migrate stop an active systemd Ollama service and restart it
-when finished. A manually started ollama process aborts the operation unless
-allow_live_ollama is enabled.
+Extras: --dry-run  --json
 """
 
 
@@ -124,6 +116,40 @@ def build_parser() -> argparse.ArgumentParser:
     thaw_p.add_argument("models", nargs="+")
     thaw_p.add_argument("--dry-run", action="store_true")
 
+    export_p = sub.add_parser("export", add_help=True)
+    export_p.add_argument("models", nargs="+")
+    export_p.add_argument(
+        "--from",
+        dest="source_tier",
+        choices=("hot", "cold"),
+        default="hot",
+        help="Store to read from (default: hot)",
+    )
+    export_p.add_argument(
+        "-o",
+        "--output",
+        type=Path,
+        default=None,
+        help="Output file or directory (default: export_path / <cold>/exports)",
+    )
+    export_p.add_argument(
+        "--remove",
+        action="store_true",
+        help="Remove model from source store after successful export",
+    )
+    export_p.add_argument("--dry-run", action="store_true")
+
+    import_p = sub.add_parser("import", add_help=True)
+    import_p.add_argument("packages", nargs="+")
+    import_p.add_argument(
+        "--to",
+        dest="dest_tier",
+        choices=("hot", "cold"),
+        default="hot",
+        help="Store to write into (default: hot)",
+    )
+    import_p.add_argument("--dry-run", action="store_true")
+
     migrate_p = sub.add_parser("migrate", add_help=True)
     migrate_p.add_argument("args", nargs="*")
     migrate_p.add_argument("--dry-run", action="store_true")
@@ -171,6 +197,7 @@ def _cmd_config(action: str, *, force: bool = False) -> int:
     print(f"config_file:           {path} ({exists})")
     print(f"hot_path:              {settings.hot_root}")
     print(f"cold_path:             {settings.cold_root}")
+    print(f"export_path:           {settings.export_root}")
     print(f"cold_mount (config):   {settings.cold_mount}")
     print(f"cold_mount (detected): {detected or '(unknown)'}")
     print(f"ollama_user:           {settings.ollama_user}")
@@ -258,6 +285,32 @@ def main(argv: Sequence[str] | None = None) -> int:
             with session:
                 return transition_models(
                     session, "thaw", ns.models, dry_run=ns.dry_run
+                )
+
+        if ns.command == "export":
+            session = prepare_mutation(
+                settings, argv=sys.argv, skip_privileges=skip
+            )
+            with session:
+                return export_models(
+                    session,
+                    ns.models,
+                    source_tier=ns.source_tier,
+                    output=ns.output,
+                    remove=ns.remove,
+                    dry_run=ns.dry_run,
+                )
+
+        if ns.command == "import":
+            session = prepare_mutation(
+                settings, argv=sys.argv, skip_privileges=skip
+            )
+            with session:
+                return import_packages(
+                    session,
+                    ns.packages,
+                    dest_tier=ns.dest_tier,
+                    dry_run=ns.dry_run,
                 )
 
         if ns.command == "migrate":

@@ -24,6 +24,7 @@ def stores(tmp_path: Path) -> tuple[Path, Path, Settings]:
         hot_root=hot.resolve(),
         cold_root=cold.resolve(),
         cold_mount=cold.resolve().parent,
+        export_root=(tmp_path / "exports").resolve(),
         ollama_user=os.environ.get("USER", "nobody"),
         ollama_service="ollama.service",
         lock_file=tmp_path / "omove.lock",

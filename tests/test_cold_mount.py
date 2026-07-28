@@ -19,6 +19,7 @@ def _settings(tmp_path: Path, *, allow: bool = False) -> Settings:
         hot_root=(tmp_path / "hot").resolve(),
         cold_root=cold.resolve(),
         cold_mount=tmp_path.resolve(),
+        export_root=(tmp_path / "exports").resolve(),
         ollama_user="nobody",
         ollama_service="ollama.service",
         lock_file=tmp_path / "lock",

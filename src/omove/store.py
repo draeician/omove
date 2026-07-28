@@ -10,7 +10,7 @@ from pathlib import Path
 
 from omove.config import Settings
 from omove.errors import AmbiguousModelError, ModelNotFoundError, UsageError
-from omove.logging_util import error, log
+from omove.logging_util import error, info, log
 from omove.manifest import blob_filename, load_manifest
 from omove.paths import (
     canonicalize_manifest_relpath,
@@ -223,13 +223,25 @@ def verify_manifest_blobs(
     manifest_path: Path,
     *,
     cache: dict[str, bool] | None = None,
+    progress: bool = False,
 ) -> bool:
     """Verify all blobs referenced by a manifest."""
-    info = load_manifest(manifest_path)
+    info_data = load_manifest(manifest_path)
     verified = cache if cache is not None else {}
-    for digest in info.digests:
+    total = len(info_data.digests)
+    for index, digest in enumerate(info_data.digests, start=1):
         blob = root / "blobs" / blob_filename(digest)
-        verify_blob(blob, digest, cache=verified)
+        if progress:
+            try:
+                size = blob.stat().st_size
+            except OSError:
+                size = 0
+            info(
+                f"Checking blob {index}/{total} "
+                f"{digest.removeprefix('sha256:')[:12]} "
+                f"({format_bytes(size)})"
+            )
+        verify_blob(blob, digest, cache=verified, progress=progress)
     return True
 
 

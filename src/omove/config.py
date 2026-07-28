@@ -47,6 +47,10 @@ hot_path = "/usr/share/ollama/.ollama/models"
 # Where omove stores frozen/archived models (the "cold" archive).
 cold_path = "/path/to/ollama_archive"
 
+# Where export packages (.omove.tar.gz) are written by default.
+# If omitted, defaults to <cold_path>/exports
+# export_path = "/path/to/omove_exports"
+
 # Optional: pin cold storage to a specific disk mount (e.g. "/opt/md2").
 # If omitted, omove auto-detects the mount that contains cold_path.
 # You do NOT need this to be the parent folder of cold_path.
@@ -136,6 +140,7 @@ class Settings:
     hot_root: Path
     cold_root: Path
     cold_mount: Path
+    export_root: Path
     ollama_user: str
     ollama_service: str
     lock_file: Path
@@ -188,6 +193,11 @@ class Settings:
             or file_str("cold_mount")
             or str(cold_root.parent)
         )
+        export_raw = (
+            env.get("OMOVE_EXPORT_PATH")
+            or file_str("export_path", "export")
+            or str(cold_root / "exports")
+        )
 
         allow_unmounted = env.get("OMOVE_ALLOW_UNMOUNTED_COLD")
         if allow_unmounted is not None:
@@ -205,6 +215,7 @@ class Settings:
             hot_root=_resolve(hot),
             cold_root=cold_root,
             cold_mount=_resolve(cold_mount_raw),
+            export_root=_resolve(export_raw),
             ollama_user=(
                 env.get("OMOVE_OLLAMA_USER")
                 or file_str("ollama_user")
@@ -246,6 +257,7 @@ PRESERVE_ENV = (
     "OMOVE_HOT_PATH",
     "OMOVE_COLD_PATH",
     "OMOVE_COLD_MOUNT",
+    "OMOVE_EXPORT_PATH",
     "OMOVE_OLLAMA_USER",
     "OMOVE_OLLAMA_SERVICE",
     "OMOVE_LOCK_FILE",

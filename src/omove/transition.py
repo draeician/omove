@@ -130,17 +130,26 @@ def transition_model(
     )
 
     info(f"Validating {display} in source storage.")
-    verify_manifest_blobs(source_root, source_manifest, cache=verified)
+    verify_manifest_blobs(
+        source_root, source_manifest, cache=verified, progress=True
+    )
     info_data = load_manifest(source_manifest)
     digests = list(info_data.digests)
     logical_size = info_data.logical_size
+    info(
+        f"Source OK for {display}: {len(digests)} blob(s), "
+        f"logical {format_bytes(logical_size)}."
+    )
     source_manifest_hash = file_sha256(source_manifest)
 
+    info("Checking free space on destination...")
     check_destination_space(
         source_root, destination_root, digests, cache=verified
     )
 
-    for digest in digests:
+    total_blobs = len(digests)
+    for index, digest in enumerate(digests, start=1):
+        info(f"Transfer blob {index}/{total_blobs}...")
         copy_blob_verified(
             session,
             source_root,
@@ -166,8 +175,12 @@ def transition_model(
         dry_run=dry_run,
     )
     if not dry_run:
+        info(f"Verifying {display} in destination storage...")
         verify_manifest_blobs(
-            destination_root, destination_manifest, cache=verified
+            destination_root,
+            destination_manifest,
+            cache=verified,
+            progress=True,
         )
         current = file_sha256(source_manifest)
         if current != source_manifest_hash:
@@ -185,6 +198,7 @@ def transition_model(
             ) from exc
         prune_empty_manifest_dirs(source_root / "manifests", source_manifest)
 
+    info("Cleaning up unreferenced source blobs...")
     try:
         reclaimed = garbage_collect_candidates(
             source_root,

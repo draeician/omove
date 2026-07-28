@@ -29,6 +29,8 @@ omove list [cold|hot]
 omove verify [cold|hot] [model ...]
 omove freeze <model> [model ...]
 omove thaw <model> [model ...]
+omove export <model> [--from hot|cold] [-o PATH] [--remove]
+omove import <package.omove.tar.gz> [--to hot|cold]
 omove migrate [all|cold|hot]
 omove freeze --dry-run <model>
 omove list hot --json
@@ -57,13 +59,15 @@ Example:
 ```toml
 hot_path = "/usr/share/ollama/.ollama/models"
 cold_path = "/opt/md2/.../models/ollama_archive"
+# export_path = "/opt/md2/.../omove_exports"   # default: <cold_path>/exports
 # cold_mount is optional; omove auto-detects the disk (e.g. /opt/md2)
 ```
 
 | Setting | Meaning |
 |---------|---------|
 | `hot_path` | Live Ollama models directory |
-| `cold_path` | Archive directory for frozen models |
+| `cold_path` | Archive directory for freeze/thaw |
+| `export_path` | Default directory for `.omove.tar.gz` packages |
 | `cold_mount` | Optional pin to a disk mount (e.g. `/opt/md2`) |
 | `allow_unmounted_cold` | Allow archive on root disk `/` (usually unsafe) |
 | `allow_live_ollama` | Allow mutate while Ollama is still running |

@@ -6,110 +6,125 @@ manifest paths and content-addressed blobs.
 
 ## Status
 
-- Primary implementation: **Python** package `src/omove/` (v0.1.0+)
-- Legacy: Bash script `omove` (v3.2.0) kept temporarily, deprecated
-- Agent system: customized for this repo
-- Note: package lives under `src/` because a root file named `omove`
-  (Bash) already occupies that path
+- Primary implementation: **Python** package `src/omove/` (**0.7.x**)
+- Public repo: https://github.com/draeician/omove
+- Legacy: `omove.bash` (Bash 3.2.0 behavioral baseline; deprecated)
+- Agent system: customized (`AGENTS.md` → `[CUSTOMIZED]`)
+- Package lives under `src/` because root naming during the port occupied
+  the historical `omove` path
 
 ## Tech stack
 
-- **Primary language**: Python 3.10+
-- **CLI**: argparse (`PYTHONPATH=src python -m omove`; console script
-  after packaging)
-- **Stdlib**: `json`, `hashlib`, `pathlib`, `fcntl`, `subprocess`
-- **External tools** (still required): `rsync` (sparse blob copy),
-  `systemctl`, `mountpoint`, `sudo`, `pgrep`
-- **Legacy**: Bash `omove` — behavioral parity baseline for the port
-- **Platform**: Linux only (systemd + Ollama layout)
+- **Language**: Python 3.10+
+- **CLI**: argparse; console script `omove` via hatchling / pipx
+- **Stdlib**: `json`, `hashlib`, `pathlib`, `fcntl`, `subprocess`, `tarfile`
+- **External tools**: `rsync` (sparse blob copy), `systemctl`, `mountpoint`,
+  `sudo` (systemctl only), `pgrep`, `findmnt`
+- **Platform**: Linux only (systemd + Ollama on-disk layout)
 
 ## Testing
 
-- Install deps (when packaged): `python3 -m venv .venv && .venv/bin/pip install -e ".[dev]"`
-- Minimal phase: `PYTHONPATH=src python3 -m pytest`
-- Lint (optional): `ruff check src/omove tests`
-- Run CLI: `PYTHONPATH=src python3 -m omove --version`
-- Manual smoke: `list`/`verify` on real stores before any `freeze`/`thaw`
+```bash
+python3 -m venv .venv && .venv/bin/pip install -e ".[dev]"
+PYTHONPATH=src python3 -m pytest
+PYTHONPATH=src python3 -m omove --version
+```
 
-## Architecture and conventions
+Manual smoke: [docs/SMOKE.md](docs/SMOKE.md).
 
-### Layout
+## Architecture
 
 ```text
 src/omove/       # Python package
-tests/           # pytest fixtures against synthetic stores
-omove            # deprecated Bash CLI (parity reference)
+tests/           # pytest against synthetic stores
+omove.bash       # deprecated Bash reference
+omove-py         # thin launcher for repo checkouts
+docs/SMOKE.md    # real-store checklist
 ```
-
-### Module boundaries
 
 | Module | Responsibility |
 |--------|----------------|
-| `config` | Env → `Settings` |
-| `paths` | Manifest path canonicalize / query match / display names |
-| `manifest` | Load/validate Ollama manifests; digest extraction |
+| `config` | File + env → `Settings` |
+| `paths` | Canonicalize / query match / display names |
+| `manifest` | Load/validate Ollama manifests; digests |
 | `store` | list / verify / enumerate |
-| `transfer` | Verified sparse blob + manifest copy |
+| `analyze` | UNIQUE vs SHARED blob reclaim trees |
+| `transfer` | Verified sparse copy; progress / `--silent` |
 | `transition` | freeze / thaw / GC |
+| `package` | export / import `.omove.tar.gz` |
 | `migrate` | Layout migration + cold-from-hot repair |
-| `system` | Lock, mount, sudo-wrapped systemctl, store checks |
+| `system` | Lock, mount checks, sudo-wrapped systemctl |
 | `cli` | argparse dispatch |
 
-### Safety rules (never violate)
+## Safety rules (never violate)
 
 1. Hot and cold roots must differ and must not nest.
 2. Refuse symlink `manifests/` or `blobs/` directories.
-3. Cold archive must not land on the root filesystem `/` unless
-   `allow_unmounted_cold` / `OMOVE_ALLOW_UNMOUNTED_COLD=1` is set.
-   `cold_mount` is an optional pin; otherwise the mount is auto-detected.
+3. Cold archive must not land on root `/` unless
+   `allow_unmounted_cold` / `OMOVE_ALLOW_UNMOUNTED_COLD=1`.
+   `cold_mount` is optional; otherwise auto-detect via `findmnt`.
 4. Mutations stop systemd Ollama and refuse a live `ollama` process unless
    `OMOVE_ALLOW_LIVE_OLLAMA=1`.
 5. Blob copies are content-verified (sha256) before rename; source
-   manifests are only removed after destination commit.
-6. Do not invent path layouts — preserve canonical
-   `host/namespace/model/tag` and legacy forms from Bash.
+   manifests are removed only after destination commit.
+6. Preserve canonical `host/namespace/model/tag` and legacy path forms.
+7. Do not `chown` store files; report permission failures clearly.
+8. Do not re-exec the whole CLI under `sudo`; elevate only `systemctl`.
 
-### Versioning
+## Behavioral notes
 
-- Python package `__version__` / `pyproject.toml` start at **0.1.0**.
-- Bash `3.2.0` is the **behavioral** baseline, not SemVer lineage.
-- Conventional commits; Manager bump policy applies after packaging.
+- **Progress** is on by default; global `--silent` opts out.
+- **Export** packages the full model (all digests), not UNIQUE-only deltas.
+- **Analyze** with no models = entire tier; **freeze/thaw/export** require
+  explicit model names (`freeze --analyze` is the all-hot preview).
+- Lock defaults to `/run/lock/omove.lock`, with user-writable fallbacks.
+- Ctrl+C during lock wait exits cleanly (130).
 
-### Environment overrides (parity with Bash)
+## Versioning
+
+- SemVer in `pyproject.toml` and `src/omove/__init__.py` (must match).
+- Bash `3.2.0` is historical parity baseline, not SemVer lineage.
+- Conventional commits; Manager bump policy on commit.
+
+## Configuration
+
+File: `~/.config/omove/config.toml` (`omove config init|show|path`).
+
+Env overrides (highest precedence):
 
 - `OLLAMA_MODELS` / `OMOVE_HOT_PATH`
 - `OMOVE_COLD_PATH` / `OMOVE_COLD_MOUNT`
+- `OMOVE_EXPORT_PATH`
 - `OMOVE_OLLAMA_USER` / `OMOVE_OLLAMA_SERVICE`
 - `OMOVE_LOCK_FILE`
 - `OMOVE_ALLOW_UNMOUNTED_COLD` / `OMOVE_ALLOW_LIVE_OLLAMA`
 
-## Roadmap
-
-1. [x] Bootstrap project truth (this file + agent modes)
-2. [x] Python core: config, paths, manifest, CLI skeleton
-3. [x] Read ops: list / verify (+ `--json`)
-4. [x] Mutation ops: freeze / thaw / GC / `--dry-run`
-5. [x] Migrate + cold repair
-6. [x] Deprecate Bash banner + smoke docs
-7. [x] Promote to `pyproject.toml` + pipx; plan Bash retirement
-
-## Bash retirement plan
-
-After real-store smoke ([docs/SMOKE.md](docs/SMOKE.md)) and
-`pipx install .`, remove the Bash `omove` script (or rename to
-`omove.bash` in an archive folder) so `omove` on PATH is the Python
-console script only.
-
-## Commands (parity)
+## Commands
 
 ```text
 omove list [cold|hot]
-omove freeze <model> [model ...]
-omove thaw <model> [model ...]
+omove analyze [hot|cold] [model ...]
 omove verify [cold|hot] [model ...]
-omove migrate [all|cold|hot]
-omove migrate cold|hot <model> ...
+omove freeze <model> ... [--dry-run] [--analyze]
+omove thaw <model> ... [--dry-run]
+omove export <model> ... [--from hot|cold] [-o PATH] [--remove] [--dry-run]
+omove import <package.omove.tar.gz> ... [--to hot|cold] [--dry-run]
+omove migrate [all|cold|hot] [--dry-run]
+omove config path|show|init
 omove version | help
 ```
 
-Python extras: `--dry-run` on mutate/migrate; `--json` on list/verify.
+Global: `--silent`, `--json` (list/verify/analyze), `--dry-run` (mutations).
+
+## Roadmap (completed through 0.7)
+
+1. [x] Bootstrap + Python core
+2. [x] Read ops: list / verify
+3. [x] Mutations: freeze / thaw / GC / dry-run
+4. [x] Migrate + packaging (pipx)
+5. [x] Config file + cold-mount auto-detect
+6. [x] Export / import packages + progress
+7. [x] Analyze UNIQUE/SHARED
+8. [x] Option B privileges (sudo systemctl only)
+9. [x] `--silent` / progress-by-default
+10. [ ] Retire `omove.bash` when unused

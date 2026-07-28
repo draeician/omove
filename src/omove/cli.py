@@ -61,6 +61,8 @@ freeze / thaw
 export / import
   Package a model (manifest + all blobs) into a portable .omove.tar.gz
   for cloud backup, or restore it later.
+  The package is the FULL model (every digest), even if layers are SHARED
+  with other local models — not a UNIQUE-only delta.
   Default export directory: <cold_path>/exports
     override with:  -o PATH  or  export_path in config  or  OMOVE_EXPORT_PATH
   --from hot|cold   which store to read (default: hot)
@@ -76,6 +78,11 @@ Paths:
   cold_mount / OMOVE_COLD_MOUNT              optional disk-mount pin
   allow_unmounted_cold                       allow archive on root disk /
   allow_live_ollama                          allow mutate while ollama runs
+
+Privileges:
+  list/verify/analyze run as your user.
+  Mutations use sudo only for systemctl stop/start/is-active.
+  Progress is on by default; --silent suppresses hash/transfer progress.
 
 Extras: --dry-run  --json  --silent
 """

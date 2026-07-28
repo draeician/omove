@@ -17,7 +17,7 @@ from omove.paths import (
     manifest_display_name,
     query_matches_relpath,
 )
-from omove.transfer import format_bytes, verify_blob
+from omove.transfer import format_bytes, progress_enabled, verify_blob
 
 
 @dataclass(frozen=True)
@@ -244,15 +244,16 @@ def verify_manifest_blobs(
     manifest_path: Path,
     *,
     cache: dict[str, bool] | None = None,
-    progress: bool = False,
+    progress: bool = True,
 ) -> bool:
     """Verify all blobs referenced by a manifest."""
     info_data = load_manifest(manifest_path)
     verified = cache if cache is not None else {}
     total = len(info_data.digests)
+    show = progress_enabled(progress)
     for index, digest in enumerate(info_data.digests, start=1):
         blob = root / "blobs" / blob_filename(digest)
-        if progress:
+        if show:
             try:
                 size = blob.stat().st_size
             except OSError:

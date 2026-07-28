@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.0] - 2026-07-27
+
+### Added
+
+- Global `--silent` to suppress hash/transfer progress (progress is on by default)
+
+### Fixed
+
+- Export/import/verify now show blob progress by default (was missing on export)
+
 ## [0.6.0] - 2026-07-27
 
 ### Changed

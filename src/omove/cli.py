@@ -20,6 +20,7 @@ from omove.migrate import run_migrate
 from omove.package import export_models, import_packages
 from omove.store import list_model_names, list_store, verify_store
 from omove.system import prepare_mutation, prepare_read_operation
+from omove.transfer import set_silent
 from omove.transition import transition_models
 
 USAGE = """\
@@ -76,7 +77,7 @@ Paths:
   allow_unmounted_cold                       allow archive on root disk /
   allow_live_ollama                          allow mutate while ollama runs
 
-Extras: --dry-run  --json
+Extras: --dry-run  --json  --silent
 """
 
 
@@ -100,6 +101,11 @@ def build_parser() -> argparse.ArgumentParser:
         "-h",
         action="store_true",
         help="Show help",
+    )
+    parser.add_argument(
+        "--silent",
+        action="store_true",
+        help="Suppress transfer/hash progress output",
     )
     parser.add_argument(
         "--skip-privileges",
@@ -310,6 +316,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if ns.command == "config":
         return _cmd_config(ns.action, force=ns.force)
 
+    set_silent(bool(getattr(ns, "silent", False)))
     skip = bool(getattr(ns, "skip_privileges", False))
 
     try:

@@ -36,6 +36,7 @@ omove migrate [all|cold|hot]
 omove freeze --dry-run <model>
 omove freeze --analyze
 omove list hot --json
+omove --silent export MODEL
 omove version
 ```
 
@@ -100,6 +101,9 @@ YOURUSER ALL=(root) NOPASSWD: OMOVE_SYSTEMCTL
 
 If `/run/lock/omove.lock` is not writable, omove falls back to
 `$XDG_RUNTIME_DIR/omove.lock` or `~/.cache/omove/omove.lock`.
+
+Hash and transfer progress is on by default. Pass ``--silent`` to suppress
+it (e.g. ``omove --silent export MODEL``).
 
 
 ## Testing

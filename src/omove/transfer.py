@@ -17,6 +17,23 @@ from omove.manifest import blob_filename
 from omove.system import Session
 
 _PROGRESS_MIN_BYTES = 16 * 1024 * 1024
+_SILENT = False
+
+
+def set_silent(silent: bool) -> None:
+    """Enable or disable progress output globally (``--silent``)."""
+    global _SILENT
+    _SILENT = bool(silent)
+
+
+def is_silent() -> bool:
+    """Return True when progress output is suppressed."""
+    return _SILENT
+
+
+def progress_enabled(requested: bool = True) -> bool:
+    """Return whether progress should be shown for this call."""
+    return bool(requested) and not _SILENT
 
 
 def format_bytes(num: int) -> str:
@@ -36,6 +53,8 @@ def format_bytes(num: int) -> str:
 
 
 def _want_progress(total: int) -> bool:
+    if _SILENT:
+        return False
     if total < _PROGRESS_MIN_BYTES:
         return False
     return sys.stderr.isatty() or sys.stdout.isatty()
@@ -95,7 +114,7 @@ def verify_blob(
     digest: str,
     *,
     cache: dict[str, bool] | None = None,
-    progress: bool = False,
+    progress: bool = True,
 ) -> None:
     """Verify blob path matches digest; raise on failure."""
     cache_key = f"{path}|{digest}"
@@ -106,7 +125,8 @@ def verify_blob(
     expected = digest.removeprefix("sha256:").lower()
     short = expected[:12]
     label = None
-    if progress:
+    show = progress_enabled(progress)
+    if show:
         try:
             size = path.stat().st_size
         except OSError:
@@ -188,7 +208,7 @@ def _rsync_copy(source: Path, destination: Path) -> None:
         "--no-owner",
         "--no-group",
     ]
-    if sys.stdout.isatty() or sys.stderr.isatty():
+    if progress_enabled() and (sys.stdout.isatty() or sys.stderr.isatty()):
         options.append("--info=progress2")
     result = subprocess.run(
         ["rsync", *options, "--", str(source), str(destination)],

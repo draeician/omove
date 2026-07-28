@@ -8,16 +8,17 @@ from collections.abc import Sequence
 from pathlib import Path
 
 from omove import __version__
+from omove.analyze import analyze_store
 from omove.config import (
     Settings,
     default_config_path,
     write_config_template,
 )
 from omove.errors import OmoveError, UsageError
-from omove.logging_util import error
+from omove.logging_util import error, info
 from omove.migrate import run_migrate
 from omove.package import export_models, import_packages
-from omove.store import list_store, verify_store
+from omove.store import list_model_names, list_store, verify_store
 from omove.system import prepare_mutation, prepare_read_operation
 from omove.transition import transition_models
 
@@ -30,7 +31,8 @@ export packages = portable .omove.tar.gz files for cloud backup
 
 Usage:
   omove list [cold|hot]
-  omove freeze <model> [model ...]
+  omove analyze [hot|cold] [model ...]
+  omove freeze <model> [model ...] [--analyze]
   omove thaw <model> [model ...]
   omove export <model> [model ...] [--from hot|cold] [-o PATH] [--remove]
   omove import <package.omove.tar.gz> [...] [--to hot|cold]
@@ -40,8 +42,20 @@ Usage:
   omove version | help
   omove config path|show|init
 
+analyze
+  Show a tree of each model's blobs and which other models share them.
+  With no model names, analyzes every model in the tier (default: hot).
+  UNIQUE = would be freed if this model alone were removed/frozen.
+  SHARED = kept until every referencing model is gone.
+  Example:  omove analyze hot
+            omove analyze cold
+            omove analyze hot gemma-4-26B-A4B-it-uncensored-GGUF:Q8_0
+            omove freeze --analyze           (preview all hot; no freeze)
+            omove freeze MODEL --analyze
+
 freeze / thaw
   Quick move between hot and cold stores (same Ollama layout).
+  Model names are required (does not freeze/thaw the whole store).
 
 export / import
   Package a model (manifest + all blobs) into a portable .omove.tar.gz
@@ -109,15 +123,40 @@ def build_parser() -> argparse.ArgumentParser:
     verify_p.add_argument("--json", action="store_true")
 
     freeze_p = sub.add_parser("freeze", add_help=True)
-    freeze_p.add_argument("models", nargs="+")
+    freeze_p.add_argument(
+        "models",
+        nargs="*",
+        help="Models to freeze (required unless --analyze)",
+    )
     freeze_p.add_argument("--dry-run", action="store_true")
+    freeze_p.add_argument(
+        "--analyze",
+        action="store_true",
+        help="Show reclaim tree for these models in hot; do not freeze",
+    )
 
     thaw_p = sub.add_parser("thaw", add_help=True)
-    thaw_p.add_argument("models", nargs="+")
+    thaw_p.add_argument(
+        "models",
+        nargs="+",
+        help="Models to thaw",
+    )
     thaw_p.add_argument("--dry-run", action="store_true")
 
+    analyze_p = sub.add_parser("analyze", add_help=True)
+    analyze_p.add_argument(
+        "args",
+        nargs="*",
+        help="Optional: hot|cold then model names (default: all in hot)",
+    )
+    analyze_p.add_argument("--json", action="store_true")
+
     export_p = sub.add_parser("export", add_help=True)
-    export_p.add_argument("models", nargs="+")
+    export_p.add_argument(
+        "models",
+        nargs="+",
+        help="Models to export",
+    )
     export_p.add_argument(
         "--from",
         dest="source_tier",
@@ -208,6 +247,29 @@ def _cmd_config(action: str, *, force: bool = False) -> int:
     return 0
 
 
+def _models_or_all(
+    settings: Settings,
+    tier: str,
+    models: list[str],
+) -> list[str]:
+    """Return explicit model list, or every model in the tier if empty."""
+    if models:
+        return list(models)
+    names = list_model_names(settings.root_for(tier), settings)
+    if not names:
+        raise UsageError(f"No models found in {tier} storage.")
+    info(f"No models specified; selecting all {len(names)} in {tier}.")
+    return names
+
+
+def _parse_analyze_args(args: list[str]) -> tuple[str, list[str]]:
+    tier = "hot"
+    rest = list(args)
+    if rest and rest[0] in {"cold", "hot"}:
+        tier = rest.pop(0)
+    return tier, rest
+
+
 def _parse_verify_args(args: list[str]) -> tuple[str, list[str]]:
     tier = "cold"
     rest = list(args)
@@ -269,7 +331,34 @@ def main(argv: Sequence[str] | None = None) -> int:
                     settings, tier, models, as_json=ns.json
                 )
 
+        if ns.command == "analyze":
+            tier, models = _parse_analyze_args(ns.args)
+            session = prepare_read_operation(
+                settings, argv=sys.argv, skip_privileges=skip
+            )
+            with session:
+                # Empty models → analyze_store already covers the whole tier.
+                if not models:
+                    info(f"No models specified; analyzing all in {tier}.")
+                return analyze_store(
+                    settings, tier, models, as_json=ns.json
+                )
+
         if ns.command == "freeze":
+            if ns.analyze:
+                session = prepare_read_operation(
+                    settings, argv=sys.argv, skip_privileges=skip
+                )
+                with session:
+                    models = _models_or_all(settings, "hot", ns.models)
+                    return analyze_store(
+                        settings, "hot", models, as_json=False
+                    )
+            if not ns.models:
+                raise UsageError(
+                    "freeze requires at least one model name "
+                    "(or use --analyze to preview reclaim)."
+                )
             session = prepare_mutation(
                 settings, argv=sys.argv, skip_privileges=skip
             )

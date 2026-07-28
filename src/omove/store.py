@@ -48,6 +48,20 @@ def iter_manifest_rels(root: Path) -> list[str]:
     return sorted(found)
 
 
+def list_model_names(root: Path, settings: Settings) -> list[str]:
+    """Return sorted display names for every valid manifest in a store."""
+    names: list[str] = []
+    for rel in iter_manifest_rels(root):
+        name = manifest_display_name(
+            rel,
+            default_host=settings.default_host,
+            default_namespace=settings.default_namespace,
+        )
+        if name is not None:
+            names.append(name)
+    return sorted(set(names), key=str.lower)
+
+
 def resolve_manifest(
     root: Path,
     query: str,
@@ -206,14 +220,21 @@ def list_store(
     if as_json:
         print(json.dumps([asdict(row) for row in rows], indent=2))
         return 0
-    print(
-        f"{'NAME':<52} {'ID':<12} {'SIZE':<10} {'MODIFIED':<12} {'STATUS':<10}"
+    name_w = max([4, *(len(row.name) for row in rows)], default=4)
+    id_w = max([2, *(len(row.id) for row in rows)], default=2)
+    size_w = max([4, *(len(row.size) for row in rows)], default=4)
+    mod_w = max([8, *(len(row.modified) for row in rows)], default=8)
+    status_w = max([6, *(len(row.status) for row in rows)], default=6)
+    header = (
+        f"{'NAME':<{name_w}}  {'ID':<{id_w}}  {'SIZE':<{size_w}}  "
+        f"{'MODIFIED':<{mod_w}}  {'STATUS':<{status_w}}"
     )
-    print("-" * 102)
+    print(header)
+    print("-" * len(header))
     for row in rows:
         print(
-            f"{row.name:<52} {row.id:<12} {row.size:<10} "
-            f"{row.modified:<12} {row.status:<10}"
+            f"{row.name:<{name_w}}  {row.id:<{id_w}}  {row.size:<{size_w}}  "
+            f"{row.modified:<{mod_w}}  {row.status:<{status_w}}"
         )
     return 0
 

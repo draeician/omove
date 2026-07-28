@@ -26,6 +26,7 @@ python3 -m venv .venv
 
 ```bash
 omove list [cold|hot]
+omove analyze [hot|cold] [model ...]
 omove verify [cold|hot] [model ...]
 omove freeze <model> [model ...]
 omove thaw <model> [model ...]
@@ -33,6 +34,7 @@ omove export <model> [--from hot|cold] [-o PATH] [--remove]
 omove import <package.omove.tar.gz> [--to hot|cold]
 omove migrate [all|cold|hot]
 omove freeze --dry-run <model>
+omove freeze --analyze
 omove list hot --json
 omove version
 ```

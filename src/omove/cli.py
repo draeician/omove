@@ -281,6 +281,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     except ValueError as exc:
         error(str(exc))
         return 1
+    except PermissionError as exc:
+        error(f"Permission denied: {exc}")
+        return 1
+    except OSError as exc:
+        error(f"OS error: {exc}")
+        return 1
 
 
 if __name__ == "__main__":

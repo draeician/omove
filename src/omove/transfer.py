@@ -161,8 +161,6 @@ def copy_blob_verified(
     session.register_temp(temp_blob)
     try:
         _rsync_copy(source_blob, temp_blob)
-        session.chown_path(temp_blob)
-        os.chmod(temp_blob, 0o644)
         verify_blob(temp_blob, digest, cache=cache)
         os.replace(temp_blob, destination_blob)
         if temp_blob in session.temps:
@@ -188,8 +186,6 @@ def copy_manifest_verified(
         return
 
     destination_dir.mkdir(parents=True, exist_ok=True)
-    session.chown_path(destination_dir)
-    os.chmod(destination_dir, 0o755)
 
     if destination_manifest.exists():
         if not destination_manifest.is_file() or destination_manifest.is_symlink():
@@ -228,8 +224,6 @@ def copy_manifest_verified(
             raise OmoveError(
                 f"Manifest verification failed after copy: {source_manifest}"
             )
-        session.chown_path(temp_manifest)
-        os.chmod(temp_manifest, 0o644)
         os.replace(temp_manifest, destination_manifest)
         if temp_manifest in session.temps:
             session.temps.remove(temp_manifest)

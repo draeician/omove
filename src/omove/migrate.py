@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -78,8 +77,6 @@ def move_manifest_to_canonical(
 
     destination_dir = destination_manifest.parent
     destination_dir.mkdir(parents=True, exist_ok=True)
-    session.chown_path(destination_dir)
-    os.chmod(destination_dir, 0o755)
 
     if destination_manifest.exists():
         if (
@@ -100,8 +97,6 @@ def move_manifest_to_canonical(
     else:
         source_manifest.rename(destination_manifest)
 
-    session.chown_path(destination_manifest)
-    os.chmod(destination_manifest, 0o644)
     prune_empty_manifest_dirs(root / "manifests", source_manifest)
     stats.manifests += 1
     log(f"MIGRATED {display}")

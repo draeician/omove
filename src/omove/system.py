@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import fcntl
 import os
-import pwd
 import shutil
 import subprocess
 import sys
@@ -163,7 +162,7 @@ def validate_cold_mount(settings: Settings) -> None:
 
 
 def ensure_hot_store(settings: Settings) -> None:
-    """Require a complete non-symlinked hot store."""
+    """Require a complete, readable hot store (no symlink dirs)."""
     hot = settings.hot_root
     manifests = hot / "manifests"
     blobs = hot / "blobs"
@@ -176,28 +175,28 @@ def ensure_hot_store(settings: Settings) -> None:
             "Hot manifests or blobs directory is a symbolic link. "
             "Refusing to continue."
         )
+    for path in (hot, manifests, blobs):
+        if not os.access(path, os.R_OK | os.X_OK):
+            raise StoreUnsafeError(
+                f"Cannot read hot store path {path}. Fix permissions and retry."
+            )
 
 
-def ollama_ids(settings: Settings) -> tuple[int, int]:
-    """Return (uid, gid) for the Ollama service account."""
-    try:
-        pw = pwd.getpwnam(settings.ollama_user)
-    except KeyError as exc:
-        raise StoreUnsafeError(
-            f"Ollama user does not exist: {settings.ollama_user}"
-        ) from exc
-    return pw.pw_uid, pw.pw_gid
+def ensure_cold_store(settings: Settings, *, writable: bool = True) -> None:
+    """Ensure cold store directories exist and are accessible.
 
-
-def ensure_cold_store(settings: Settings) -> tuple[int, int]:
-    """Ensure cold store directories exist with correct ownership."""
+    Does not change ownership. Permission problems are reported so the user
+    can fix them.
+    """
     validate_cold_mount(settings)
-    uid, gid = ollama_ids(settings)
     cold = settings.cold_root
     for path in (cold, cold / "manifests", cold / "blobs"):
-        path.mkdir(mode=0o755, parents=True, exist_ok=True)
-        os.chown(path, uid, gid)
-        os.chmod(path, 0o755)
+        try:
+            path.mkdir(mode=0o755, parents=True, exist_ok=True)
+        except OSError as exc:
+            raise StoreUnsafeError(
+                f"Cannot create cold store path {path}: {exc}"
+            ) from exc
     manifests = cold / "manifests"
     blobs = cold / "blobs"
     if manifests.is_symlink() or blobs.is_symlink():
@@ -205,13 +204,28 @@ def ensure_cold_store(settings: Settings) -> tuple[int, int]:
             "Cold manifests or blobs directory is a symbolic link. "
             "Refusing to continue."
         )
-    return uid, gid
+    mode = os.R_OK | os.X_OK | (os.W_OK if writable else 0)
+    need = "read/write" if writable else "read"
+    for path in (cold, manifests, blobs):
+        if not os.access(path, mode):
+            raise StoreUnsafeError(
+                f"Cannot {need} cold store path {path}. "
+                "Fix permissions and retry."
+            )
 
 
 def acquire_lock(lock_file: Path) -> int:
     """Acquire an exclusive flock; return the open fd."""
-    lock_file.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
-    fd = os.open(str(lock_file), os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        lock_file.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
+    except OSError as exc:
+        raise StoreUnsafeError(
+            f"Cannot create lock directory {lock_file.parent}: {exc}"
+        ) from exc
+    try:
+        fd = os.open(str(lock_file), os.O_RDWR | os.O_CREAT, 0o644)
+    except OSError as exc:
+        raise StoreUnsafeError(f"Cannot open lock file {lock_file}: {exc}") from exc
     try:
         fcntl.flock(fd, fcntl.LOCK_EX)
     except OSError as exc:
@@ -289,11 +303,9 @@ def start_ollama_service(settings: Settings) -> bool:
 
 @dataclass
 class Session:
-    """Holds lock, ownership, temps, and optional service restart."""
+    """Holds lock, temps, and optional service restart."""
 
     settings: Settings
-    uid: int
-    gid: int
     lock_fd: int
     service_was_active: bool = False
     temps: list[Path] = field(default_factory=list)
@@ -303,12 +315,6 @@ class Session:
         """Track a temporary path for cleanup."""
         self.temps.append(path)
         return path
-
-    def chown_path(self, path: Path) -> None:
-        """Apply Ollama ownership unless privileges are skipped."""
-        if self.skip_privileges:
-            return
-        os.chown(path, self.uid, self.gid)
 
     def close(self, *, success: bool) -> int:
         """Clean temps, restart service if needed, release lock."""
@@ -360,20 +366,9 @@ def prepare_read_operation(
     if skip_privileges:
         validate_roots(settings)
         ensure_hot_store(settings)
-        for path in (
-            settings.cold_root,
-            settings.cold_root / "manifests",
-            settings.cold_root / "blobs",
-        ):
-            path.mkdir(mode=0o755, parents=True, exist_ok=True)
-        try:
-            uid, gid = ollama_ids(settings)
-        except StoreUnsafeError:
-            uid, gid = os.getuid(), os.getgid()
+        ensure_cold_store(settings, writable=True)
         return Session(
             settings=settings,
-            uid=uid,
-            gid=gid,
             lock_fd=-1,
             skip_privileges=True,
         )
@@ -394,12 +389,10 @@ def prepare_read_operation(
     )
     validate_roots(settings)
     ensure_hot_store(settings)
-    uid, gid = ensure_cold_store(settings)
+    ensure_cold_store(settings, writable=True)
     lock_fd = acquire_lock(settings.lock_file)
     return Session(
         settings=settings,
-        uid=uid,
-        gid=gid,
         lock_fd=lock_fd,
         skip_privileges=False,
     )

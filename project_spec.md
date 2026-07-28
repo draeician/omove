@@ -59,7 +59,9 @@ omove            # deprecated Bash CLI (parity reference)
 
 1. Hot and cold roots must differ and must not nest.
 2. Refuse symlink `manifests/` or `blobs/` directories.
-3. Cold path must be on a mount point unless `OMOVE_ALLOW_UNMOUNTED_COLD=1`.
+3. Cold archive must not land on the root filesystem `/` unless
+   `allow_unmounted_cold` / `OMOVE_ALLOW_UNMOUNTED_COLD=1` is set.
+   `cold_mount` is an optional pin; otherwise the mount is auto-detected.
 4. Mutations stop systemd Ollama and refuse a live `ollama` process unless
    `OMOVE_ALLOW_LIVE_OLLAMA=1`.
 5. Blob copies are content-verified (sha256) before rename; source

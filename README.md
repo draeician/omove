@@ -42,18 +42,35 @@ Without install (repo checkout):
 # or: PYTHONPATH=src python3 -m omove list hot
 ```
 
-### Environment
+### Environment / config
 
-| Variable | Purpose |
-|----------|---------|
-| `OLLAMA_MODELS` / `OMOVE_HOT_PATH` | Hot model root |
-| `OMOVE_COLD_PATH` | Cold archive root |
-| `OMOVE_COLD_MOUNT` | Mount that must contain cold storage |
-| `OMOVE_OLLAMA_USER` | Service account (default `ollama`) |
-| `OMOVE_OLLAMA_SERVICE` | systemd unit (default `ollama.service`) |
-| `OMOVE_LOCK_FILE` | Lock path |
-| `OMOVE_ALLOW_UNMOUNTED_COLD=1` | Allow cold on non-mount path |
-| `OMOVE_ALLOW_LIVE_OLLAMA=1` | Allow mutate while ollama is live |
+Optional file: `~/.config/omove/config.toml`
+
+```bash
+omove config init    # write a starter file
+omove config show    # effective settings (+ detected disk mount)
+omove config path    # print the file path
+```
+
+Example:
+
+```toml
+hot_path = "/usr/share/ollama/.ollama/models"
+cold_path = "/opt/md2/.../models/ollama_archive"
+# cold_mount is optional; omove auto-detects the disk (e.g. /opt/md2)
+```
+
+| Setting | Meaning |
+|---------|---------|
+| `hot_path` | Live Ollama models directory |
+| `cold_path` | Archive directory for frozen models |
+| `cold_mount` | Optional pin to a disk mount (e.g. `/opt/md2`) |
+| `allow_unmounted_cold` | Allow archive on root disk `/` (usually unsafe) |
+| `allow_live_ollama` | Allow mutate while Ollama is still running |
+
+Env vars `OMOVE_*` / `OLLAMA_MODELS` still work and override the file.
+Precedence: **environment > config file > defaults**.
+
 
 ## Testing
 

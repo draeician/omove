@@ -7,7 +7,11 @@ import sys
 from collections.abc import Sequence
 
 from omove import __version__
-from omove.config import Settings
+from omove.config import (
+    Settings,
+    default_config_path,
+    write_config_template,
+)
 from omove.errors import OmoveError, UsageError
 from omove.logging_util import error
 from omove.migrate import run_migrate
@@ -17,6 +21,10 @@ from omove.transition import transition_models
 
 USAGE = """\
 omove - Ollama Tiered Storage Manager
+
+Moves Ollama models between:
+  hot  = the live model directory Ollama uses
+  cold = an archive directory you choose (often on a bigger/slower disk)
 
 Usage:
   omove list [cold|hot]
@@ -28,31 +36,41 @@ Usage:
   omove migrate hot <model> [model ...]
   omove version
   omove help
+  omove config path|show|init
 
-Model names may be supplied in normal Ollama forms, for example:
-  llama3.2
-  llama3.2:latest
-  team/model:production
-  registry.example.com:5000/team/model:production
+Config file (recommended):
+  ~/.config/omove/config.toml
+  Create with:  omove config init
+  Precedence:   environment > config file > defaults
 
-Environment overrides:
-  OLLAMA_MODELS                 Effective Ollama model root
-  OMOVE_HOT_PATH                Overrides OLLAMA_MODELS
-  OMOVE_COLD_PATH               Cold archive root
-  OMOVE_COLD_MOUNT              Mount point that must contain cold storage
-  OMOVE_OLLAMA_USER             Ollama service account, default: ollama
-  OMOVE_OLLAMA_SERVICE          systemd unit, default: ollama.service
-  OMOVE_LOCK_FILE               Lock file, default: /run/lock/omove.lock
-  OMOVE_ALLOW_UNMOUNTED_COLD=1  Permit cold storage on a non-mount-point path
-  OMOVE_ALLOW_LIVE_OLLAMA=1     Permit mutation while an Ollama process is live
+What the path settings mean:
+  hot_path / OMOVE_HOT_PATH / OLLAMA_MODELS
+      Live Ollama models directory.
+  cold_path / OMOVE_COLD_PATH
+      Archive directory for frozen models.
+  cold_mount / OMOVE_COLD_MOUNT
+      Optional. Disk mount that should hold the archive (example: /opt/md2).
+      If omitted, omove detects it automatically. It does NOT need to be the
+      parent folder of cold_path.
+  allow_unmounted_cold / OMOVE_ALLOW_UNMOUNTED_COLD=1
+      Allow the archive to live on the root disk (/). Off by default because
+      that often means a removable disk was not mounted.
+  allow_live_ollama / OMOVE_ALLOW_LIVE_OLLAMA=1
+      Allow changes while Ollama is still running. Off by default because that
+      can corrupt models.
+
+Other:
+  OMOVE_OLLAMA_USER      Service account (default: ollama)
+  OMOVE_OLLAMA_SERVICE   systemd unit (default: ollama.service)
+  OMOVE_LOCK_FILE        Lock file path
 
 Python extras:
-  --dry-run                     Plan freeze/thaw/migrate without mutating
-  --json                        Machine-readable list/verify output
+  --dry-run   Show freeze/thaw/migrate plan without changing files
+  --json      Machine-readable list/verify output
 
-The freeze, thaw, and migrate commands stop an active systemd Ollama service
-and restart it when the operation finishes. A manually started Ollama process
-causes the operation to abort unless OMOVE_ALLOW_LIVE_OLLAMA=1 is set.
+freeze/thaw/migrate stop an active systemd Ollama service and restart it
+when finished. A manually started ollama process aborts the operation unless
+allow_live_ollama is enabled.
 """
 
 
@@ -110,9 +128,57 @@ def build_parser() -> argparse.ArgumentParser:
     migrate_p.add_argument("args", nargs="*")
     migrate_p.add_argument("--dry-run", action="store_true")
 
+    config_p = sub.add_parser("config", add_help=True)
+    config_p.add_argument(
+        "action",
+        nargs="?",
+        default="show",
+        choices=("path", "show", "init"),
+    )
+    config_p.add_argument(
+        "--force",
+        action="store_true",
+        help="Overwrite existing config on init",
+    )
+
     sub.add_parser("version", add_help=True)
     sub.add_parser("help", add_help=True)
     return parser
+
+
+def _cmd_config(action: str, *, force: bool = False) -> int:
+    """Handle config path|show|init."""
+    if action == "path":
+        print(default_config_path())
+        return 0
+    if action == "init":
+        try:
+            path = write_config_template(force=force)
+        except FileExistsError as exc:
+            error(str(exc))
+            error("Re-run with --force to overwrite, or edit the file.")
+            return 1
+        print(f"Wrote {path}")
+        print("Edit hot_path and cold_path, then run: omove config show")
+        return 0
+
+    settings = Settings.load()
+    path = settings.config_path or default_config_path()
+    exists = "yes" if path.is_file() else "no (using defaults/env)"
+    from omove.system import filesystem_mount
+
+    detected = filesystem_mount(settings.cold_root)
+    print(f"config_file:           {path} ({exists})")
+    print(f"hot_path:              {settings.hot_root}")
+    print(f"cold_path:             {settings.cold_root}")
+    print(f"cold_mount (config):   {settings.cold_mount}")
+    print(f"cold_mount (detected): {detected or '(unknown)'}")
+    print(f"ollama_user:           {settings.ollama_user}")
+    print(f"ollama_service:        {settings.ollama_service}")
+    print(f"lock_file:             {settings.lock_file}")
+    print(f"allow_unmounted_cold:  {settings.allow_unmounted_cold}")
+    print(f"allow_live_ollama:     {settings.allow_live_ollama}")
+    return 0
 
 
 def _parse_verify_args(args: list[str]) -> tuple[str, list[str]]:
@@ -152,7 +218,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"omove {__version__}")
         return 0
 
-    settings = Settings.from_env()
+    if ns.command == "config":
+        return _cmd_config(ns.action, force=ns.force)
+
+    settings = Settings.load()
     skip = bool(getattr(ns, "skip_privileges", False))
 
     try:
@@ -209,6 +278,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     except OmoveError as exc:
         error(str(exc))
         return exc.exit_code
+    except ValueError as exc:
+        error(str(exc))
+        return 1
 
 
 if __name__ == "__main__":

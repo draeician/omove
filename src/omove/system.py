@@ -65,24 +65,101 @@ def validate_roots(settings: Settings) -> None:
         raise StoreUnsafeError("Cold storage cannot be inside hot storage.")
 
 
-def validate_cold_mount(settings: Settings) -> None:
-    """Require cold mount to be a mount point unless overridden."""
-    if settings.allow_unmounted_cold:
-        return
-    mount = settings.cold_mount
-    if not mount.is_dir():
-        raise StoreUnsafeError(f"Cold mount path does not exist: {mount}")
+def filesystem_mount(path: Path) -> Path | None:
+    """Return the mount TARGET that contains *path*, if detectable."""
+    if shutil.which("findmnt") is None:
+        return None
+    probe = path if path.exists() else path.parent
     result = subprocess.run(
-        ["mountpoint", "-q", "--", str(mount)],
+        ["findmnt", "-n", "-o", "TARGET", "--target", str(probe)],
         check=False,
         capture_output=True,
+        text=True,
     )
     if result.returncode != 0:
+        return None
+    lines = result.stdout.strip().splitlines()
+    if not lines:
+        return None
+    return Path(lines[0].strip())
+
+
+def validate_cold_mount(settings: Settings) -> None:
+    """Ensure cold storage is on a real mounted disk, not root ``/``.
+
+    Classic failure: a removable/NAS path is configured but not mounted, so
+    the "archive" is an empty folder on the system disk and filling it can
+    exhaust ``/``.
+
+    We detect the mount that contains ``cold_path`` via ``findmnt``.
+    ``cold_mount`` is optional: if it *is* a mountpoint, cold storage must
+    live on that mount. If it is just a normal parent directory (common when
+    the archive is nested under a deeper path), it is ignored.
+    """
+    if settings.allow_unmounted_cold:
+        return
+
+    cold = settings.cold_root
+    probe = cold if cold.exists() else cold.parent
+    if not probe.is_dir():
         raise StoreUnsafeError(
-            f"{mount} is not a mount point. Refusing to use "
-            f"{settings.cold_root}. Set OMOVE_COLD_MOUNT correctly or "
-            "explicitly set OMOVE_ALLOW_UNMOUNTED_COLD=1."
+            "Cold archive path does not exist yet and its parent is missing: "
+            f"{cold}"
         )
+
+    actual = filesystem_mount(probe)
+    if actual is None:
+        mount = settings.cold_mount
+        if not mount.is_dir():
+            raise StoreUnsafeError(
+                f"Cannot find the disk mount for cold archive {cold}, and "
+                f"cold_mount path does not exist: {mount}"
+            )
+        result = subprocess.run(
+            ["mountpoint", "-q", "--", str(mount)],
+            check=False,
+            capture_output=True,
+        )
+        if result.returncode != 0:
+            raise StoreUnsafeError(
+                f"Cannot verify that cold archive {cold} is on a mounted "
+                "disk.\n"
+                "Install findmnt, set cold_mount to the disk mount "
+                f"(try: findmnt -n -o TARGET --target {probe}), or set "
+                "allow_unmounted_cold = true if you intentionally keep the "
+                "archive on this filesystem."
+            )
+        return
+
+    if actual == Path("/"):
+        raise StoreUnsafeError(
+            f"Cold archive {cold} is on the root filesystem (/).\n"
+            "That often means a dedicated disk is not mounted, and writing "
+            "here can fill your system disk.\n"
+            "Fix: put the archive on another disk, or set "
+            "allow_unmounted_cold = true in ~/.config/omove/config.toml "
+            "(or OMOVE_ALLOW_UNMOUNTED_COLD=1) if you really mean to use /."
+        )
+
+    configured = settings.cold_mount
+    configured_is_mount = (
+        subprocess.run(
+            ["mountpoint", "-q", "--", str(configured)],
+            check=False,
+            capture_output=True,
+        ).returncode
+        == 0
+    )
+    if configured_is_mount and actual != configured:
+        try:
+            cold.resolve().relative_to(configured.resolve())
+        except ValueError as exc:
+            raise StoreUnsafeError(
+                f"Cold archive {cold} is on mount {actual}, but config "
+                f"cold_mount is {configured}.\n"
+                f'Set cold_mount = "{actual}" (or omit it), or set '
+                "allow_unmounted_cold = true."
+            ) from exc
 
 
 def ensure_hot_store(settings: Settings) -> None:
@@ -311,6 +388,7 @@ def prepare_read_operation(
         "stat",
         "numfmt",
         "date",
+        "findmnt",
         "mountpoint",
         "install",
     )

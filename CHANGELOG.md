@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.0] - 2026-07-27
+
+### Changed
+
+- No longer re-exec the whole CLI under `sudo`; mutations call
+  `sudo systemctl` only (matches fine-grained NOPASSWD sudoers)
+- `list` / `verify` / `analyze` never prompt for a password
+- Ctrl+C during lock wait exits cleanly (no traceback); lock wait message
+- Lock file falls back to `$XDG_RUNTIME_DIR` or `~/.cache/omove` when
+  `/run/lock` is not writable
+
 ## [0.5.0] - 2026-07-27
 
 ### Added

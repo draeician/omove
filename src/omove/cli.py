@@ -310,10 +310,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     if ns.command == "config":
         return _cmd_config(ns.action, force=ns.force)
 
-    settings = Settings.load()
     skip = bool(getattr(ns, "skip_privileges", False))
 
     try:
+        settings = Settings.load()
         if ns.command == "list":
             session = prepare_read_operation(
                 settings, argv=sys.argv, skip_privileges=skip
@@ -413,6 +413,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 )
 
         raise UsageError(f"Unknown command: {ns.command}")
+    except KeyboardInterrupt:
+        error("Interrupted.")
+        return 130
     except UsageError as exc:
         error(str(exc))
         print(USAGE, file=sys.stderr)

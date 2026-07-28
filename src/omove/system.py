@@ -2,17 +2,18 @@
 
 from __future__ import annotations
 
+import errno
 import fcntl
 import os
 import shutil
 import subprocess
-import sys
+import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import TracebackType
 
-from omove.config import PRESERVE_ENV, Settings
+from omove.config import Settings
 from omove.errors import StoreUnsafeError
 from omove.logging_util import error, info, warn
 
@@ -28,19 +29,33 @@ def require_commands(*names: str) -> None:
         raise StoreUnsafeError("Missing required commands.")
 
 
-def require_root(argv: Sequence[str] | None = None) -> None:
-    """Re-exec under sudo when not running as root."""
+def systemctl_argv(*args: str) -> list[str]:
+    """Build a systemctl argv, prefixing ``sudo`` when not root.
+
+    Matches fine-grained sudoers aliases (Option B) that allow only
+    ``systemctl`` for the Ollama unit — never a full process re-exec.
+    """
+    systemctl = shutil.which("systemctl")
+    if systemctl is None:
+        raise StoreUnsafeError("Required command not found: systemctl")
     if os.geteuid() == 0:
-        return
-    if shutil.which("sudo") is None:
+        return [systemctl, *args]
+    sudo = shutil.which("sudo")
+    if sudo is None:
         raise StoreUnsafeError(
-            "This command requires root privileges and sudo is unavailable."
+            "sudo is required to control the Ollama systemd unit. "
+            "Install sudo, or run as root."
         )
-    args = list(argv if argv is not None else sys.argv)
-    preserve = ",".join(PRESERVE_ENV)
-    os.execvp(
-        "sudo",
-        ["sudo", f"--preserve-env={preserve}", "--", sys.executable, *args],
+    return [sudo, systemctl, *args]
+
+
+def run_systemctl(*args: str) -> subprocess.CompletedProcess[str]:
+    """Run systemctl (via sudo when needed)."""
+    return subprocess.run(
+        systemctl_argv(*args),
+        check=False,
+        capture_output=True,
+        text=True,
     )
 
 
@@ -214,24 +229,95 @@ def ensure_cold_store(settings: Settings, *, writable: bool = True) -> None:
             )
 
 
+def lock_candidates(preferred: Path) -> list[Path]:
+    """Ordered lock paths: configured, then user-writable fallbacks."""
+    paths = [preferred]
+    runtime = os.environ.get("XDG_RUNTIME_DIR")
+    if runtime:
+        paths.append(Path(runtime) / "omove.lock")
+    paths.append(Path.home() / ".cache" / "omove" / "omove.lock")
+    # Preserve order, drop duplicates.
+    seen: set[Path] = set()
+    unique: list[Path] = []
+    for path in paths:
+        key = path.resolve() if path.parent.exists() else path
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(path)
+    return unique
+
+
+def open_lock_file(lock_file: Path) -> tuple[Path, int]:
+    """Open a usable lock file, falling back if the preferred path fails."""
+    errors: list[str] = []
+    for path in lock_candidates(lock_file):
+        try:
+            path.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
+            fd = os.open(str(path), os.O_RDWR | os.O_CREAT, 0o644)
+        except OSError as exc:
+            errors.append(f"{path}: {exc}")
+            continue
+        if path != lock_file:
+            warn(
+                f"Cannot use lock_file {lock_file}; using {path} instead."
+            )
+        return path, fd
+    detail = "; ".join(errors) if errors else "no candidates"
+    raise StoreUnsafeError(f"Cannot open lock file ({detail})")
+
+
 def acquire_lock(lock_file: Path) -> int:
-    """Acquire an exclusive flock; return the open fd."""
+    """Acquire an exclusive flock; return the open fd.
+
+    Prints a waiting message if the lock is held. Ctrl+C cancels cleanly.
+    """
+    _path, fd = open_lock_file(lock_file)
     try:
-        lock_file.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
-    except OSError as exc:
-        raise StoreUnsafeError(
-            f"Cannot create lock directory {lock_file.parent}: {exc}"
-        ) from exc
-    try:
-        fd = os.open(str(lock_file), os.O_RDWR | os.O_CREAT, 0o644)
-    except OSError as exc:
-        raise StoreUnsafeError(f"Cannot open lock file {lock_file}: {exc}") from exc
-    try:
-        fcntl.flock(fd, fcntl.LOCK_EX)
-    except OSError as exc:
-        os.close(fd)
-        raise StoreUnsafeError(f"Unable to acquire lock: {lock_file}") from exc
-    return fd
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return fd
+        except BlockingIOError:
+            info(f"Waiting for lock ({_path}); Ctrl+C to cancel.")
+        except OSError as exc:
+            if getattr(exc, "errno", None) not in {
+                errno.EACCES,
+                errno.EAGAIN,
+                errno.EWOULDBLOCK,
+            }:
+                raise StoreUnsafeError(
+                    f"Unable to acquire lock: {_path}"
+                ) from exc
+            info(f"Waiting for lock ({_path}); Ctrl+C to cancel.")
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return fd
+            except BlockingIOError:
+                time.sleep(0.25)
+            except OSError as exc:
+                if getattr(exc, "errno", None) in {
+                    errno.EACCES,
+                    errno.EAGAIN,
+                    errno.EWOULDBLOCK,
+                }:
+                    time.sleep(0.25)
+                    continue
+                raise StoreUnsafeError(
+                    f"Unable to acquire lock: {_path}"
+                ) from exc
+    except KeyboardInterrupt:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        raise
+    except Exception:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        raise
 
 
 def stop_ollama_for_mutation(
@@ -241,10 +327,8 @@ def stop_ollama_for_mutation(
     pgrep: Callable[..., subprocess.CompletedProcess[str]] | None = None,
 ) -> bool:
     """Stop systemd Ollama if active. Return True if we stopped it."""
-    run_systemctl = systemctl or (
-        lambda *args: subprocess.run(
-            list(args), check=False, capture_output=True, text=True
-        )
+    run_ctl = systemctl or (
+        lambda *args: run_systemctl(*args)
     )
     run_pgrep = pgrep or (
         lambda *args: subprocess.run(
@@ -253,17 +337,14 @@ def stop_ollama_for_mutation(
     )
     service_was_active = False
     if shutil.which("systemctl"):
-        active = run_systemctl(
-            "systemctl", "is-active", "--quiet", settings.ollama_service
-        )
+        # No --quiet: keeps sudoers rules simple (exact argv match).
+        active = run_ctl("is-active", settings.ollama_service)
         if active.returncode == 0:
             info(
                 f"Stopping {settings.ollama_service} for a consistent "
                 "storage transaction."
             )
-            stopped = run_systemctl(
-                "systemctl", "stop", settings.ollama_service
-            )
+            stopped = run_ctl("stop", settings.ollama_service)
             if stopped.returncode != 0:
                 raise StoreUnsafeError(
                     f"Failed to stop {settings.ollama_service}."
@@ -287,12 +368,7 @@ def stop_ollama_for_mutation(
 
 def start_ollama_service(settings: Settings) -> bool:
     """Start the Ollama systemd unit. Return False on failure."""
-    result = subprocess.run(
-        ["systemctl", "start", settings.ollama_service],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
+    result = run_systemctl("start", settings.ollama_service)
     if result.returncode != 0:
         error(
             f"Failed to restart {settings.ollama_service}. Start it manually."
@@ -353,6 +429,7 @@ class Session:
         exc: BaseException | None,
         tb: TracebackType | None,
     ) -> None:
+        # Treat interrupt as unsuccessful so Ollama still restarts if needed.
         self.close(success=exc_type is None)
 
 
@@ -361,8 +438,14 @@ def prepare_read_operation(
     *,
     argv: Sequence[str] | None = None,
     skip_privileges: bool = False,
+    cold_writable: bool = False,
 ) -> Session:
-    """Validate stores and acquire lock for read operations."""
+    """Validate stores and acquire lock for read operations.
+
+    Does not elevate the process. Store paths must be readable (and cold
+    writable when requested) by the invoking user.
+    """
+    del argv  # Kept for call-site compatibility; no longer used for re-exec.
     if skip_privileges:
         validate_roots(settings)
         ensure_hot_store(settings)
@@ -373,7 +456,6 @@ def prepare_read_operation(
             skip_privileges=True,
         )
 
-    require_root(argv)
     require_commands(
         "readlink",
         "flock",
@@ -389,7 +471,7 @@ def prepare_read_operation(
     )
     validate_roots(settings)
     ensure_hot_store(settings)
-    ensure_cold_store(settings, writable=True)
+    ensure_cold_store(settings, writable=cold_writable)
     lock_fd = acquire_lock(settings.lock_file)
     return Session(
         settings=settings,
@@ -407,7 +489,10 @@ def prepare_mutation(
 ) -> Session:
     """Prepare a mutation session (lock + optional Ollama stop)."""
     session = prepare_read_operation(
-        settings, argv=argv, skip_privileges=skip_privileges
+        settings,
+        argv=argv,
+        skip_privileges=skip_privileges,
+        cold_writable=True,
     )
     if not skip_privileges:
         require_commands("rsync", "df", "pgrep", "sync")

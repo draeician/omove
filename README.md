@@ -77,6 +77,30 @@ cold_path = "/opt/md2/.../models/ollama_archive"
 Env vars `OMOVE_*` / `OLLAMA_MODELS` still work and override the file.
 Precedence: **environment > config file > defaults**.
 
+### Privileges (no full sudo re-exec)
+
+`list` / `verify` / `analyze` run as your user (no password prompt).
+Mutations (`freeze` / `thaw` / `export` / `import` / `migrate`) call
+`sudo systemctl …` only to stop/start Ollama. Give yourself read/write on
+the hot and cold stores (group or ACL); do **not** need root for the whole
+CLI.
+
+Example sudoers (`visudo -f /etc/sudoers.d/omove`):
+
+```sudoers
+Cmnd_Alias OMOVE_SYSTEMCTL = \
+  /usr/bin/systemctl is-active ollama.service, \
+  /usr/bin/systemctl stop ollama.service, \
+  /usr/bin/systemctl start ollama.service, \
+  /bin/systemctl is-active ollama.service, \
+  /bin/systemctl stop ollama.service, \
+  /bin/systemctl start ollama.service
+YOURUSER ALL=(root) NOPASSWD: OMOVE_SYSTEMCTL
+```
+
+If `/run/lock/omove.lock` is not writable, omove falls back to
+`$XDG_RUNTIME_DIR/omove.lock` or `~/.cache/omove/omove.lock`.
+
 
 ## Testing
 

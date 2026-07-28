@@ -52,7 +52,7 @@ omove            # deprecated Bash CLI (parity reference)
 | `transfer` | Verified sparse blob + manifest copy |
 | `transition` | freeze / thaw / GC |
 | `migrate` | Layout migration + cold-from-hot repair |
-| `system` | Root/sudo, lock, mount, systemd, ownership |
+| `system` | Lock, mount, sudo-wrapped systemctl, store checks |
 | `cli` | argparse dispatch |
 
 ### Safety rules (never violate)

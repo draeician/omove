@@ -3,8 +3,8 @@
 Precedence (highest wins): environment → config file → built-in defaults.
 
 Config path: ``$XDG_CONFIG_HOME/omove/config.toml`` (default
-``~/.config/omove/config.toml``). When re-executed under sudo, the
-invoking user's config is used via ``SUDO_USER`` / preserved ``HOME``.
+``~/.config/omove/config.toml``). Config is always loaded for the
+invoking user (``HOME`` / ``XDG_CONFIG_HOME`` / ``SUDO_USER`` when present).
 """
 
 from __future__ import annotations

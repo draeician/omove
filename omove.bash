@@ -1,14 +1,23 @@
 #!/usr/bin/env bash
 # omove - Ollama Tiered Storage Manager
-# v3.1.1: preserve the original CLI arguments across sudo re-execution.
+# v3.2.0: add safe migration from legacy omove layouts.
 # Safely transitions Ollama models between hot and cold storage while
 # preserving canonical manifest paths and shared, content-addressed blobs.
+#
+# DEPRECATED: Prefer the Python implementation:
+#   PYTHONPATH=src python3 -m omove ...
+# or, after packaging:  pipx install . && omove ...
+# This Bash script is kept temporarily as a behavioral parity reference.
+
+if [[ -z "${OMOVE_SUPPRESS_DEPRECATION:-}" ]]; then
+    printf 'WARNING: Bash omove is deprecated; use: PYTHONPATH=src python3 -m omove\n' >&2
+fi
 
 set -Eeuo pipefail
 IFS=$'\n\t'
 umask 022
 
-VERSION="3.1.1"
+VERSION="3.2.0"
 
 HOT_ROOT="${OMOVE_HOT_PATH:-${OLLAMA_MODELS:-/usr/share/ollama/.ollama/models}}"
 COLD_ROOT="${OMOVE_COLD_PATH:-/media/elysium/ollama_archive}"
@@ -39,6 +48,12 @@ RESOLVED_REL=""
 RESOLVED_CANONICAL_REL=""
 CANONICAL_REL=""
 GC_RECLAIMED=0
+LAYOUT_KIND=""
+MIGRATED_REL=""
+MIGRATED_CHANGED=0
+MIGRATION_MANIFESTS=0
+MIGRATION_BLOBS=0
+MIGRATION_UNRESOLVED=0
 ORIGINAL_ARGS=("$@")
 
 log()   { printf '%s\n' "$*"; }
@@ -55,6 +70,9 @@ Usage:
   omove freeze <model> [model ...]
   omove thaw <model> [model ...]
   omove verify [cold|hot] [model ...]
+  omove migrate [all|cold|hot]
+  omove migrate cold <model> [model ...]
+  omove migrate hot <model> [model ...]
   omove version
   omove help
 
@@ -75,8 +93,8 @@ Environment overrides:
   OMOVE_ALLOW_UNMOUNTED_COLD=1  Permit cold storage on a non-mount-point path
   OMOVE_ALLOW_LIVE_OLLAMA=1     Permit mutation while an Ollama process is live
 
-The freeze and thaw commands stop an active systemd Ollama service and restart
-it when the operation finishes. A manually started Ollama process causes the
+The freeze, thaw, and migrate commands stop an active systemd Ollama service
+and restart it when the operation finishes. A manually started Ollama process causes the
 operation to abort unless OMOVE_ALLOW_LIVE_OLLAMA=1 is explicitly set.
 USAGE
 }
@@ -272,19 +290,49 @@ valid_legacy_manifest_relpath() {
     [[ "$tag" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,79}$ ]] || return 1
 }
 
+# Older omove thaw releases created hot manifests as
+# host/namespace/model:tag instead of host/namespace/model/tag.
+valid_flat_tag_manifest_relpath() {
+    local rel=$1
+    local host namespace model_tag extra model tag
+    IFS='/' read -r host namespace model_tag extra <<< "$rel"
+
+    [[ -n "$host" && -n "$namespace" && -n "$model_tag" && -z "${extra:-}" ]] || return 1
+    [[ "$model_tag" == *:* ]] || return 1
+    model="${model_tag%:*}"
+    tag="${model_tag##*:}"
+
+    [[ "$host" =~ ^[A-Za-z0-9_][A-Za-z0-9_.:-]{0,349}$ ]] || return 1
+    [[ "$namespace" =~ ^[A-Za-z0-9_][A-Za-z0-9_-]{0,79}$ ]] || return 1
+    [[ "$model" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,79}$ ]] || return 1
+    [[ "$tag" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,79}$ ]] || return 1
+}
+
 canonicalize_manifest_relpath() {
     local rel=$1
-    local model tag
+    local host namespace model_tag model tag
 
     CANONICAL_REL=""
+    LAYOUT_KIND=""
     if valid_manifest_relpath "$rel"; then
         CANONICAL_REL="$rel"
+        LAYOUT_KIND="canonical"
         return 0
     fi
 
     if valid_legacy_manifest_relpath "$rel"; then
         IFS='/' read -r model tag <<< "$rel"
         CANONICAL_REL="$DEFAULT_HOST/$DEFAULT_NAMESPACE/$model/$tag"
+        LAYOUT_KIND="legacy-cold"
+        return 0
+    fi
+
+    if valid_flat_tag_manifest_relpath "$rel"; then
+        IFS='/' read -r host namespace model_tag <<< "$rel"
+        model="${model_tag%:*}"
+        tag="${model_tag##*:}"
+        CANONICAL_REL="$host/$namespace/$model/$tag"
+        LAYOUT_KIND="legacy-flat"
         return 0
     fi
 
@@ -802,6 +850,200 @@ transition_model() {
     log "$action_past $display to $action_direction. Logical size: $logical_human; source space reclaimed: $reclaimed_human."
 }
 
+
+move_manifest_to_canonical() {
+    local root=$1
+    local rel=$2
+    local source_manifest destination_manifest destination_dir display
+
+    MIGRATED_REL="$rel"
+    MIGRATED_CHANGED=0
+    canonicalize_manifest_relpath "$rel" || {
+        error "Cannot migrate invalid manifest path: $rel"
+        return 1
+    }
+
+    if [[ "$rel" == "$CANONICAL_REL" ]]; then
+        return 0
+    fi
+
+    source_manifest="$root/manifests/$rel"
+    destination_manifest="$root/manifests/$CANONICAL_REL"
+    destination_dir="$(dirname -- "$destination_manifest")"
+    display="$(manifest_display_name "$CANONICAL_REL")"
+
+    install -d -o "$OLLAMA_USER" -g "$OLLAMA_GROUP" -m 0755 -- "$destination_dir" || return 1
+
+    if [[ -e "$destination_manifest" ]]; then
+        [[ -f "$destination_manifest" && ! -L "$destination_manifest" ]] || {
+            error "Canonical manifest destination is not a regular file: $destination_manifest"
+            return 1
+        }
+        if ! cmp -s -- "$source_manifest" "$destination_manifest"; then
+            error "Conflicting canonical manifest already exists for $display"
+            error "Legacy:    $source_manifest"
+            error "Canonical: $destination_manifest"
+            return 1
+        fi
+        rm -f -- "$source_manifest" || return 1
+    else
+        mv -- "$source_manifest" "$destination_manifest" || return 1
+    fi
+
+    chown "$OLLAMA_USER:$OLLAMA_GROUP" -- "$destination_manifest" || return 1
+    chmod 0644 -- "$destination_manifest" || return 1
+    sync -f "$destination_dir" 2>/dev/null || true
+    prune_empty_manifest_dirs "$root/manifests" "$source_manifest"
+
+    MIGRATED_REL="$CANONICAL_REL"
+    MIGRATED_CHANGED=1
+    MIGRATION_MANIFESTS=$((MIGRATION_MANIFESTS + 1))
+    log "MIGRATED $display"
+}
+
+repair_cold_manifest_from_hot() {
+    local rel=$1
+    local manifest="$COLD_ROOT/manifests/$rel"
+    local display digest filename cold_blob hot_blob
+    local -a copyable=()
+    local -a unresolved=()
+
+    canonicalize_manifest_relpath "$rel" || return 1
+    display="$(manifest_display_name "$CANONICAL_REL")"
+    load_manifest "$manifest" || return 1
+
+    for digest in "${MANIFEST_DIGESTS[@]}"; do
+        filename="$(blob_filename "$digest")"
+        cold_blob="$COLD_ROOT/blobs/$filename"
+        hot_blob="$HOT_ROOT/blobs/$filename"
+
+        if [[ -e "$cold_blob" ]]; then
+            [[ -f "$cold_blob" && ! -L "$cold_blob" ]] || {
+                error "Cold blob path is not a regular file: $cold_blob"
+                return 1
+            }
+            continue
+        fi
+
+        if [[ -f "$hot_blob" && ! -L "$hot_blob" ]]; then
+            copyable+=("$digest")
+        else
+            unresolved+=("$digest")
+        fi
+    done
+
+    if (( ${#copyable[@]} > 0 )); then
+        check_destination_space "$HOT_ROOT" "$COLD_ROOT" "${copyable[@]}" || return 1
+        for digest in "${copyable[@]}"; do
+            copy_blob_verified "$HOT_ROOT" "$COLD_ROOT" "$digest" || return 1
+            MIGRATION_BLOBS=$((MIGRATION_BLOBS + 1))
+        done
+        log "REPAIRED $display (${#copyable[@]} blob(s) copied from hot storage)"
+    fi
+
+    if (( ${#unresolved[@]} > 0 )); then
+        error "$display still has ${#unresolved[@]} blob(s) unavailable in both cold and hot storage:"
+        for digest in "${unresolved[@]}"; do
+            printf '  %s\n' "$digest" >&2
+        done
+        MIGRATION_UNRESOLVED=$((MIGRATION_UNRESOLVED + 1))
+        return 1
+    fi
+
+    return 0
+}
+
+migrate_cold_rel() {
+    local rel=$1
+    local current_rel
+    local layout_rc=0
+    local repair_rc=0
+
+    canonicalize_manifest_relpath "$rel" || {
+        error "Invalid cold manifest path: $rel"
+        return 1
+    }
+
+    # Cold manifests may be canonicalized even when blobs are still missing.
+    # This changes metadata layout only and never deletes a blob.
+    move_manifest_to_canonical "$COLD_ROOT" "$rel" || layout_rc=1
+    (( layout_rc == 0 )) || return 1
+    current_rel="$MIGRATED_REL"
+
+    repair_cold_manifest_from_hot "$current_rel" || repair_rc=1
+    return "$repair_rc"
+}
+
+migrate_hot_rel() {
+    local rel=$1
+
+    canonicalize_manifest_relpath "$rel" || {
+        error "Invalid hot manifest path: $rel"
+        return 1
+    }
+
+    [[ "$rel" != "$CANONICAL_REL" ]] || return 0
+
+    # Do not make a previously ignored malformed hot manifest visible to Ollama
+    # unless every referenced blob is present and valid.
+    verify_manifest_blobs "$HOT_ROOT" "$HOT_ROOT/manifests/$rel" || return 1
+    move_manifest_to_canonical "$HOT_ROOT" "$rel"
+}
+
+migrate_store() {
+    local tier=$1
+    shift
+    local root rel query
+    local status=0
+    local -a requested=("$@")
+
+    case "$tier" in
+        cold) root="$COLD_ROOT" ;;
+        hot)  root="$HOT_ROOT" ;;
+        *)
+            error "migrate tier must be 'cold' or 'hot'."
+            return 2
+            ;;
+    esac
+
+    if (( ${#requested[@]} > 0 )); then
+        for query in "${requested[@]}"; do
+            if ! resolve_manifest "$root" "$query"; then
+                status=1
+                continue
+            fi
+            rel="$RESOLVED_REL"
+            if [[ "$tier" == "cold" ]]; then
+                migrate_cold_rel "$rel" || status=1
+            else
+                migrate_hot_rel "$rel" || status=1
+            fi
+        done
+        return "$status"
+    fi
+
+    # Snapshot paths before migration because successful migrations rename files.
+    local -a rels=()
+    while IFS= read -r -d '' rel; do
+        rels+=("$rel")
+    done < <(find "$root/manifests" -mindepth 2 -maxdepth 4 -type f -printf '%P\0' | sort -z)
+
+    for rel in "${rels[@]}"; do
+        [[ -e "$root/manifests/$rel" ]] || continue
+        if [[ "$tier" == "cold" ]]; then
+            migrate_cold_rel "$rel" || status=1
+        else
+            migrate_hot_rel "$rel" || status=1
+        fi
+    done
+
+    return "$status"
+}
+
+migration_summary() {
+    log "Migration summary: $MIGRATION_MANIFESTS manifest(s) canonicalized; $MIGRATION_BLOBS blob(s) restored from hot storage; $MIGRATION_UNRESOLVED model(s) remain incomplete."
+}
+
 list_store() {
     local tier=$1
     local root rel manifest display manifest_hash logical_size logical_human modified status
@@ -949,6 +1191,29 @@ main() {
             fi
             prepare_read_operation "$@"
             verify_store "$tier" "$@"
+            ;;
+        migrate)
+            shift
+            tier="all"
+            if (( $# > 0 )) && [[ "$1" == "all" || "$1" == "cold" || "$1" == "hot" ]]; then
+                tier=$1
+                shift
+            fi
+            if [[ "$tier" == "all" && $# -gt 0 ]]; then
+                error "Model selection requires an explicit migrate tier: cold or hot."
+                usage >&2
+                return 2
+            fi
+            prepare_mutation "$@"
+            status=0
+            if [[ "$tier" == "all" || "$tier" == "hot" ]]; then
+                migrate_store hot "$@" || status=1
+            fi
+            if [[ "$tier" == "all" || "$tier" == "cold" ]]; then
+                migrate_store cold "$@" || status=1
+            fi
+            migration_summary
+            return "$status"
             ;;
         freeze)
             shift

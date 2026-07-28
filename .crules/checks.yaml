@@ -1,0 +1,10 @@
+# Machine-checkable verification gate (run with: crules --verify)
+# Every command must exit 0. Agents may not declare work done while this fails.
+# The Bootstrapper should replace these with the project's real commands.
+checks:
+  # - name: tests
+  #   run: .venv/bin/pytest -q
+  # - name: lint
+  #   run: .venv/bin/ruff check .
+  # - name: version-consistency
+  #   run: python3 -c "import tomllib,sys,importlib; ..."

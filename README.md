@@ -198,7 +198,10 @@ disk.
   `sudo systemctl …` only to stop/start Ollama — the CLI itself is **not**
   re-executed as root.
 - You need read (and for mutations, write) access to hot and cold yourself
-  (group membership or ACLs). omove does **not** `chown` store files.
+  (group membership or ACLs). Before mutations omove walks nested dirs under
+  `manifests/` (and `blobs/`), reports every inaccessible path at once, and
+  on a TTY can offer `sudo chmod g+w`, then if needed
+  `sudo chown ollama_user:ollama_user` (default `ollama`) on those paths.
 
 Example sudoers (`visudo -f /etc/sudoers.d/omove`):
 

@@ -19,7 +19,8 @@ manifest paths and content-addressed blobs.
 - **CLI**: argparse; console script `omove` via hatchling / pipx
 - **Stdlib**: `json`, `hashlib`, `pathlib`, `fcntl`, `subprocess`, `tarfile`
 - **External tools**: `rsync` (sparse blob copy), `systemctl`, `mountpoint`,
-  `sudo` (systemctl only), `pgrep`, `findmnt`
+  `sudo` (systemctl; confirmed `chmod`/`chown` for store dirs), `pgrep`,
+  `findmnt`
 - **Platform**: Linux only (systemd + Ollama on-disk layout)
 
 ## Testing
@@ -53,7 +54,7 @@ docs/SMOKE.md    # real-store checklist
 | `transition` | freeze / thaw / GC |
 | `package` | export / import `.omove.tar.gz` |
 | `migrate` | Layout migration + cold-from-hot repair |
-| `system` | Lock, mount checks, sudo-wrapped systemctl |
+| `system` | Lock, mount checks, systemctl / confirmed chmod+chown |
 | `cli` | argparse dispatch |
 
 ## Safety rules (never violate)
@@ -68,8 +69,14 @@ docs/SMOKE.md    # real-store checklist
 5. Blob copies are content-verified (sha256) before rename; source
    manifests are removed only after destination commit.
 6. Preserve canonical `host/namespace/model/tag` and legacy path forms.
-7. Do not `chown` store files; report permission failures clearly.
-8. Do not re-exec the whole CLI under `sudo`; elevate only `systemctl`.
+7. Do not silently `chown` store files. Report permission failures clearly.
+   Mutations require write access on hot and cold store directories
+   (including nested dirs under `manifests/`) and collect every failure
+   before aborting. On an interactive TTY, omove may offer
+   `sudo chmod g+w`, then if needed
+   `sudo chown ollama_user:ollama_user`, after confirmation.
+8. Do not re-exec the whole CLI under `sudo`; elevate only `systemctl`
+   and confirmed `chmod`/`chown` for store directory permission fixes.
 
 ## Behavioral notes
 

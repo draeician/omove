@@ -7,6 +7,7 @@ import fcntl
 import os
 import shutil
 import subprocess
+import sys
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
@@ -176,8 +177,272 @@ def validate_cold_mount(settings: Settings) -> None:
             ) from exc
 
 
-def ensure_hot_store(settings: Settings) -> None:
-    """Require a complete, readable hot store (no symlink dirs)."""
+def iter_store_dirs(root: Path) -> list[Path]:
+    """List store root, manifests, blobs, and nested dirs under them.
+
+    Nested host/namespace/model dirs under ``manifests/`` are included so
+    mutations fail before transfers when only leaf dirs lack group write.
+    Does not follow directory symlinks.
+    """
+    manifests = root / "manifests"
+    blobs = root / "blobs"
+    ordered: list[Path] = []
+    seen: set[Path] = set()
+
+    def add(path: Path) -> None:
+        key = path
+        if key in seen:
+            return
+        seen.add(key)
+        ordered.append(path)
+
+    add(root)
+    add(manifests)
+    add(blobs)
+    for base in (manifests, blobs):
+        if not base.is_dir() or base.is_symlink():
+            continue
+        for dirpath, dirnames, _filenames in os.walk(base, followlinks=False):
+            current = Path(dirpath)
+            # Do not descend through symlinked directories.
+            dirnames[:] = [
+                name
+                for name in dirnames
+                if not (current / name).is_symlink()
+            ]
+            if current != base:
+                add(current)
+    return ordered
+
+
+def inaccessible_paths(paths: Sequence[Path], mode: int) -> list[Path]:
+    """Return every path that fails ``os.access`` for ``mode``."""
+    return [path for path in paths if not os.access(path, mode)]
+
+
+def prompt_yes_no(question: str, *, input_func: Callable[[str], str] | None = None) -> bool:
+    """Ask a yes/no question on a TTY; return False when non-interactive."""
+    if input_func is None and not sys.stdin.isatty():
+        return False
+    reader = input_func or input
+    try:
+        answer = reader(f"{question} [y/N] ").strip().lower()
+    except EOFError:
+        return False
+    return answer in {"y", "yes"}
+
+
+def _run_privileged(
+    argv_as_root: Sequence[str],
+    *,
+    failure: str,
+    runner: Callable[..., subprocess.CompletedProcess[str]] | None = None,
+) -> None:
+    """Run ``argv_as_root`` as root, prefixing ``sudo`` when needed."""
+    if os.geteuid() == 0:
+        argv = list(argv_as_root)
+    else:
+        sudo = shutil.which("sudo")
+        if sudo is None:
+            raise StoreUnsafeError(
+                "sudo is required to fix store directory permissions. "
+                "Install sudo, or run as root."
+            )
+        argv = [sudo, *argv_as_root]
+    run = runner or (
+        lambda *args, **kwargs: subprocess.run(
+            *args,
+            text=True,
+            capture_output=True,
+            check=False,
+            **kwargs,
+        )
+    )
+    result = run(argv)
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "").strip()
+        raise StoreUnsafeError(
+            failure + (f": {detail}" if detail else ".")
+        )
+
+
+def chmod_group_write(
+    paths: Sequence[Path],
+    *,
+    runner: Callable[..., subprocess.CompletedProcess[str]] | None = None,
+) -> None:
+    """Run ``chmod g+w`` on paths, via ``sudo`` when not root."""
+    if not paths:
+        return
+    _run_privileged(
+        ["chmod", "g+w", "--", *[str(p) for p in paths]],
+        failure="Failed to apply group-write permissions",
+        runner=runner,
+    )
+
+
+def validate_chown_owner(owner: str) -> str:
+    """Return a safe owner name for ``chown owner:owner``, or raise."""
+    name = owner.strip()
+    if (
+        not name
+        or name in {".", ".."}
+        or "/" in name
+        or "\\" in name
+        or ":" in name
+        or "\0" in name
+        or any(ch.isspace() for ch in name)
+    ):
+        raise StoreUnsafeError(
+            f"Invalid ollama_user for ownership fix: {owner!r}"
+        )
+    return name
+
+
+def chown_owner(
+    paths: Sequence[Path],
+    owner: str,
+    *,
+    runner: Callable[..., subprocess.CompletedProcess[str]] | None = None,
+) -> None:
+    """Run ``chown owner:owner`` on paths, via ``sudo`` when not root.
+
+    Only used after an interactive confirmation when group-write alone cannot
+    restore access (e.g. directories owned by root:root).
+    """
+    if not paths:
+        return
+    name = validate_chown_owner(owner)
+    _run_privileged(
+        ["chown", f"{name}:{name}", "--", *[str(p) for p in paths]],
+        failure=f"Failed to change ownership to {name}:{name}",
+        runner=runner,
+    )
+
+
+def ensure_store_access(
+    label: str,
+    root: Path,
+    *,
+    writable: bool,
+    offer_fix: bool = False,
+    owner: str | None = None,
+    prompt: Callable[[str], bool] | None = None,
+    chmod: Callable[[Sequence[Path]], None] | None = None,
+    chown: Callable[[Sequence[Path], str], None] | None = None,
+) -> None:
+    """Require access to ``root`` and nested store dirs; optionally fix writes.
+
+    Collects every inaccessible directory before reporting. When ``writable``
+    and ``offer_fix`` are true, prompts to run ``sudo chmod g+w``, then if
+    paths remain inaccessible and ``owner`` is set, prompts for
+    ``sudo chown owner:owner`` (and reapplies group-write).
+    """
+    mode = os.R_OK | os.X_OK | (os.W_OK if writable else 0)
+    need = "read/write" if writable else "read"
+    paths = iter_store_dirs(root)
+    bad = inaccessible_paths(paths, mode)
+    if not bad:
+        return
+
+    listing = "\n".join(f"  {path}" for path in bad)
+    ask = prompt if prompt is not None else prompt_yes_no
+    apply_chmod = chmod if chmod is not None else chmod_group_write
+    apply_chown = chown if chown is not None else chown_owner
+
+    if writable and offer_fix:
+        warn(
+            f"Cannot {need} {len(bad)} {label} store path(s):\n{listing}"
+        )
+        interactive = prompt is not None or sys.stdin.isatty()
+        if not interactive:
+            raise StoreUnsafeError(
+                f"Cannot {need} {len(bad)} {label} store path(s):\n"
+                f"{listing}\n"
+                "Fix permissions and retry (non-interactive; no fix prompt)."
+            )
+
+        chmod_ok = ask(
+            "Grant group-write (sudo chmod g+w) on these directories?"
+        )
+        if chmod_ok:
+            info(f"Applying group-write to {len(bad)} {label} path(s)...")
+            apply_chmod(bad)
+            still_bad = inaccessible_paths(paths, mode)
+            if not still_bad:
+                info(f"{label.capitalize()} store permissions look OK.")
+                return
+            bad = still_bad
+            listing = "\n".join(f"  {path}" for path in bad)
+            warn(
+                f"Still cannot {need} {len(bad)} {label} store path(s) "
+                f"after chmod (often wrong group/owner):\n{listing}"
+            )
+        elif owner is None:
+            raise StoreUnsafeError(
+                f"Cannot {need} {len(bad)} {label} store path(s):\n"
+                f"{listing}\n"
+                "Permission fix declined. Fix permissions and retry."
+            )
+
+        if owner is not None:
+            try:
+                owner_name = validate_chown_owner(owner)
+            except StoreUnsafeError:
+                owner_name = owner.strip() or owner
+            if ask(
+                f"Change ownership to {owner_name}:{owner_name} "
+                f"(sudo chown) on remaining directories?"
+            ):
+                info(
+                    f"Changing ownership of {len(bad)} {label} path(s) "
+                    f"to {owner_name}:{owner_name}..."
+                )
+                apply_chown(bad, owner)
+                # Group write may still be missing after a chown from 755.
+                apply_chmod(bad)
+                still_bad = inaccessible_paths(paths, mode)
+                if not still_bad:
+                    info(f"{label.capitalize()} store permissions look OK.")
+                    return
+                still = "\n".join(f"  {path}" for path in still_bad)
+                raise StoreUnsafeError(
+                    f"Still cannot {need} {len(still_bad)} {label} store "
+                    f"path(s) after chown/chmod:\n{still}\n"
+                    "Fix permissions manually and retry."
+                )
+            raise StoreUnsafeError(
+                f"Cannot {need} {len(bad)} {label} store path(s):\n"
+                f"{listing}\n"
+                "Permission fix declined. Fix permissions and retry."
+            )
+
+        still = "\n".join(f"  {path}" for path in bad)
+        raise StoreUnsafeError(
+            f"Still cannot {need} {len(bad)} {label} store "
+            f"path(s) after chmod:\n{still}\n"
+            "Fix permissions manually and retry "
+            "(or set ollama_user and allow chown)."
+        )
+
+    raise StoreUnsafeError(
+        f"Cannot {need} {len(bad)} {label} store path(s):\n{listing}\n"
+        "Fix permissions and retry."
+    )
+
+
+def ensure_hot_store(
+    settings: Settings,
+    *,
+    writable: bool = False,
+    offer_fix: bool = False,
+) -> None:
+    """Require a complete, accessible hot store (no symlink dirs).
+
+    When ``writable`` is true (mutations), also require write access so
+    freeze/thaw fail before long transfers. Optional interactive fixes may
+    chmod / chown after confirmation.
+    """
     hot = settings.hot_root
     manifests = hot / "manifests"
     blobs = hot / "blobs"
@@ -190,18 +455,25 @@ def ensure_hot_store(settings: Settings) -> None:
             "Hot manifests or blobs directory is a symbolic link. "
             "Refusing to continue."
         )
-    for path in (hot, manifests, blobs):
-        if not os.access(path, os.R_OK | os.X_OK):
-            raise StoreUnsafeError(
-                f"Cannot read hot store path {path}. Fix permissions and retry."
-            )
+    ensure_store_access(
+        "hot",
+        hot,
+        writable=writable,
+        offer_fix=offer_fix,
+        owner=settings.ollama_user if offer_fix else None,
+    )
 
 
-def ensure_cold_store(settings: Settings, *, writable: bool = True) -> None:
+def ensure_cold_store(
+    settings: Settings,
+    *,
+    writable: bool = True,
+    offer_fix: bool = False,
+) -> None:
     """Ensure cold store directories exist and are accessible.
 
-    Does not change ownership. Permission problems are reported so the user
-    can fix them.
+    Permission problems are reported so the user can fix them (optionally
+    via confirmed ``sudo chmod g+w`` and ``sudo chown`` to ``ollama_user``).
     """
     validate_cold_mount(settings)
     cold = settings.cold_root
@@ -219,14 +491,13 @@ def ensure_cold_store(settings: Settings, *, writable: bool = True) -> None:
             "Cold manifests or blobs directory is a symbolic link. "
             "Refusing to continue."
         )
-    mode = os.R_OK | os.X_OK | (os.W_OK if writable else 0)
-    need = "read/write" if writable else "read"
-    for path in (cold, manifests, blobs):
-        if not os.access(path, mode):
-            raise StoreUnsafeError(
-                f"Cannot {need} cold store path {path}. "
-                "Fix permissions and retry."
-            )
+    ensure_store_access(
+        "cold",
+        cold,
+        writable=writable,
+        offer_fix=offer_fix,
+        owner=settings.ollama_user if offer_fix else None,
+    )
 
 
 def lock_candidates(preferred: Path) -> list[Path]:
@@ -439,17 +710,27 @@ def prepare_read_operation(
     argv: Sequence[str] | None = None,
     skip_privileges: bool = False,
     cold_writable: bool = False,
+    hot_writable: bool = False,
 ) -> Session:
     """Validate stores and acquire lock for read operations.
 
-    Does not elevate the process. Store paths must be readable (and cold
-    writable when requested) by the invoking user.
+    Does not elevate the process. Store paths must be readable (and writable
+    when requested) by the invoking user.
     """
     del argv  # Kept for call-site compatibility; no longer used for re-exec.
+    offer_fix = not skip_privileges
     if skip_privileges:
         validate_roots(settings)
-        ensure_hot_store(settings)
-        ensure_cold_store(settings, writable=True)
+        ensure_hot_store(
+            settings,
+            writable=hot_writable,
+            offer_fix=False,
+        )
+        ensure_cold_store(
+            settings,
+            writable=True,
+            offer_fix=False,
+        )
         return Session(
             settings=settings,
             lock_fd=-1,
@@ -470,8 +751,16 @@ def prepare_read_operation(
         "install",
     )
     validate_roots(settings)
-    ensure_hot_store(settings)
-    ensure_cold_store(settings, writable=cold_writable)
+    ensure_hot_store(
+        settings,
+        writable=hot_writable,
+        offer_fix=offer_fix and hot_writable,
+    )
+    ensure_cold_store(
+        settings,
+        writable=cold_writable,
+        offer_fix=offer_fix and cold_writable,
+    )
     lock_fd = acquire_lock(settings.lock_file)
     return Session(
         settings=settings,
@@ -493,6 +782,7 @@ def prepare_mutation(
         argv=argv,
         skip_privileges=skip_privileges,
         cold_writable=True,
+        hot_writable=True,
     )
     if not skip_privileges:
         require_commands("rsync", "df", "pgrep", "sync")

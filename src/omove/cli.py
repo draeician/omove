@@ -81,7 +81,9 @@ Paths:
 
 Privileges:
   list/verify/analyze run as your user.
-  Mutations use sudo only for systemctl stop/start/is-active.
+  Mutations use sudo for systemctl stop/start/is-active, and may offer
+  confirmed ``sudo chmod g+w`` / ``sudo chown ollama_user:ollama_user`` when
+  store directories are not writable by your user.
   Progress is on by default; --silent suppresses hash/transfer progress.
 
 Extras: --dry-run  --json  --silent

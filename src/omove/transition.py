@@ -194,7 +194,12 @@ def transition_model(
         except OSError as exc:
             raise OmoveError(
                 f"Failed to remove source manifest after destination commit: "
-                f"{source_manifest}"
+                f"{source_manifest}\n"
+                f"OS error: {exc}\n"
+                "Both storage tiers retain a complete copy. Fix write "
+                "permissions on the source manifests directory (group write, "
+                "ACLs, or ownership), then retry — or remove the source "
+                "manifest manually and re-run to reclaim blobs."
             ) from exc
         prune_empty_manifest_dirs(source_root / "manifests", source_manifest)
 

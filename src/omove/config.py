@@ -64,8 +64,8 @@ cold_path = "/path/to/ollama_archive"
 # Unsafe: Ollama may be reading/writing the same files.
 # allow_live_ollama = false
 
-# ollama_user / ollama_service are informational for service control only.
-# omove does not change file ownership; fix permissions yourself if needed.
+# ollama_user is used for service context and optional confirmed chown fixes.
+# ollama_service names the systemd unit (stop/start during mutations).
 # ollama_user = "ollama"
 # ollama_service = "ollama.service"
 # lock_file = "/run/lock/omove.lock"

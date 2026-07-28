@@ -5,6 +5,23 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.2] - 2026-07-28
+
+### Fixed
+
+- Mutations now require write access on the hot store up front (same as cold),
+  so `freeze` fails before long blob transfers when the user cannot delete
+  manifests owned by `ollama`
+- Store access checks walk nested directories under `manifests/` / `blobs/` and
+  report every inaccessible path at once (not just top-level store dirs)
+- On an interactive TTY, mutations offer `sudo chmod g+w` on the failing
+  directories after confirmation, then re-check
+- If group-write is not enough (e.g. dirs owned by `root:root` with mode
+  775), offer confirmed `sudo chown ollama_user:ollama_user` and reapply
+  group-write so users in the Ollama group can mutate the store
+- Post-commit source-manifest unlink errors include the OS errno and recovery
+  guidance (dual-copy state is safe)
+
 ## [0.7.1] - 2026-07-27
 
 ### Changed
